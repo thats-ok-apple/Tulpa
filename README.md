@@ -6,7 +6,7 @@
 
 [下载 Windows 版](https://github.com/fumingyang2004/Tulpa/releases/latest) · [功能清单](doc/FEATURES.md) · [OneBot 配置教程](doc/SNOWLUMA_SETUP.md) · [参与开发](doc/CONTRIBUTING.md)
 
-Tulpa 是面向 Windows 的个人通信工作台。聊天和资料保存在本机，Agent 在你选择的平台、会话和时间范围内检索，按需读取图片、语音和文件。桌面版解压即用；浏览器入口保留用于开发与测试。
+Tulpa 是个人通信工作台，提供 Windows 桌面版和 [macOS 源码预览版](macos/README.md)。聊天和资料保存在本机，Agent 在你选择的平台、会话和时间范围内检索，按需读取图片、语音和文件。桌面版解压即用；浏览器入口保留用于开发与测试。
 
 **MCP 轻量版：把 QQ / 微信资料接入你正在使用的 Agent。**
 
