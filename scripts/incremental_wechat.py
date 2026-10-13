@@ -51,7 +51,7 @@ def export_delta(reader,metadata,request,load_stickers,batch_dir=None,*,read_ima
                 if not re.fullmatch(r'Msg_[a-fA-F0-9]{32}',table):raise ValueError('微信表结构异常')
                 key=rel.replace('\\','/')+'/'+table
                 prior=previous.get('cursors',{}).get(key)
-                top=boundary(conn,table,'local_id',['server_id','create_time'],prior,allow_server_ack=True)
+                top=boundary(conn,table,'local_id',['server_id','create_time'],prior,allow_server_ack=True,replay_missing=True)
                 replay=top.pop('replay_from',prior['last'] if prior else 0)
                 if request.get('conversations') is not None:
                     import hashlib

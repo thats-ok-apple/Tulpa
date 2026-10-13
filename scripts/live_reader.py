@@ -288,7 +288,7 @@ class Reader:
                 if len(messages)>=4000:
                     if prior:cursors[ck]=prior
                     more=True;continue
-                try:top=boundary(db,table,'local_id',['server_id','create_time'],prior,allow_server_ack=True)
+                try:top=boundary(db,table,'local_id',['server_id','create_time'],prior,allow_server_ack=True,replay_missing=True)
                 except ValueError:
                     # Upload completion can replace an already nonzero WX file
                     # server ID. Replay only a locally verified acknowledgement;

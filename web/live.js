@@ -1,5 +1,5 @@
 'use strict';
-let liveLastId=0,liveBusy=false,liveEditing=false,liveRefreshAt=0;
+let liveLastId=0,liveBusy=false,liveDataBusy=false,liveEditing=false,liveRefreshAt=0;
 const liveLabels={unsupported:'Mac 尚未支持',starting:'正在启动',listening:'监听中',receiving:'读取新增',retrying:'正在重试',degraded:'实时读取受限',client_stopped:'客户端未运行',needs_baseline:'需先导入'};
 const liveShortLabels={unsupported:'Mac 未适配',starting:'启动中',listening:'监听中',receiving:'更新中',retrying:'重试中',degraded:'读取受限',client_stopped:'未运行',needs_baseline:'待导入'};
 function liveLabel(p,short=false) {
@@ -11,6 +11,19 @@ function liveDetail(p) {
   return '本工具的实时监听已关闭；可在下方选择“数据库监听”并保存。与历史导入的平台勾选无关，也不代表客户端已退出。';
 }
 function liveClock(value) {return value?new Date(value*1000).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'尚无';}
+async function refreshLiveData(upper) {
+  if(liveDataBusy)return;
+  liveDataBusy=true;liveRefreshAt=Date.now();
+  try {
+    if(window.TULPA_MCP_ONLY){await refreshHome();}
+    else{const refreshed=await call('refresh',[]);setData(refreshed[0],refreshed[1]);await loadWatches();}
+    liveLastId=upper;
+    await watchApi('/api/live-visible',{through_id:upper});
+  } catch(error) {
+    // Data panels may lag without making a successful status read look stale
+    // or disconnected. The next eligible refresh retries independently.
+  } finally {liveDataBusy=false;}
+}
 async function pollLive() {
   if(liveBusy||document.hidden)return;
   liveBusy=true;
@@ -33,14 +46,9 @@ async function pollLive() {
       $('wechat-read-images').checked=data.settings.wechat_read_images!==false;
     }
     const upper=Math.max(...data.platforms.map(p=>p.last_id||0));
-    if(upper>liveLastId && state.ready && !state.busy && !state.loading && Date.now()-liveRefreshAt>5000) {
-      liveRefreshAt=Date.now();
-      if(window.TULPA_MCP_ONLY){await refreshHome();}
-      else{const refreshed=await call('refresh',[]);setData(refreshed[0],refreshed[1]);await loadWatches();}
-      liveLastId=upper;
-      // Timestamp means the visible UI has refreshed its local data, not that
-      // the user opened/read every newly arrived message bubble.
-      await watchApi('/api/live-visible',{through_id:upper});
+    if(upper>liveLastId && !liveDataBusy && state.ready && !state.busy && !state.loading && Date.now()-liveRefreshAt>5000) {
+      // A slow data refresh must never hold the two-second health poll.
+      void refreshLiveData(upper);
     }
   } catch(error) {
     $('live-summary').textContent='实时状态连接中断';
@@ -62,3 +70,4 @@ $('live-save').onclick=async()=>{
 };
 setInterval(pollLive,2000);void pollLive();
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void pollLive();});
+window.addEventListener('focus',()=>{void pollLive();});

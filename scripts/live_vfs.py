@@ -111,6 +111,8 @@ class PageView:
         self.platform = platform
         self.path = Path(path)
         self.before = family_stamp(path)
+        self.snapshot_ready = False
+        self.wal_header = None
         self.offset = 1024 if platform == 'qq' else 0
         self.main = self.path.open('rb')
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / '.tmp', prefix='live-pages-')
@@ -158,6 +160,8 @@ class PageView:
                     raise ValueError('wal_too_large')
                 target = folder / 'view-wal'
                 shutil.copyfile(source_wal, target)
+                with target.open('rb') as header_stream:
+                    self.wal_header=header_stream.read(32)
                 if source_shm.exists():
                     shutil.copyfile(source_shm, folder / 'view-shm')
                 self.assert_fresh()
@@ -184,12 +188,25 @@ class PageView:
                     lock_page, page_no=262144, source_wrapper_size=1024, platform_name=os.name):
                     raise ValueError('qq_live_lock_page_invalid')
             self.assert_fresh()
+            self.snapshot_ready = True
         except BaseException:
             self.close()
             raise
 
     def assert_fresh(self):
-        if family_stamp(self.path) != self.before:
+        current=family_stamp(self.path)
+        if self.snapshot_ready:
+            # Our WAL copy is immutable and checksum-validated. Later commits
+            # in the same WAL generation belong to the next poll; only a main
+            # rewrite/checkpoint or WAL reset can invalidate this read.
+            try:
+                with open(str(self.path)+'-wal','rb') as stream:header=stream.read(32)
+            except FileNotFoundError:header=None
+            fresh=current[0]==self.before[0] and header==self.wal_header
+        else:
+            # Capture itself must still use a stable DB/WAL/SHM family.
+            fresh=current==self.before
+        if not fresh:
             raise SourceBusy('Client database changed during read')
 
     def page(self, number):

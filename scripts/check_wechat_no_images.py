@@ -176,6 +176,29 @@ def check_live_path(folder,reader,metadata):
         del worker.request['wechat_read_images']
         with patch.object(WeChatMediaRetries,'collect',return_value=([],{})):worker.wechat()
         assert created==[False,True,False,True]
+        # Repeated deleted boundaries must recover through both real export
+        # paths. More than 2,000 rows proves live replay drains in batches.
+        table='Msg_'+hashlib.md5(CHAT.encode()).hexdigest()
+        with sqlite3.connect(reader.path) as db:
+            db.execute(f'DELETE FROM "{table}" WHERE local_id=5')
+            db.executemany(f'INSERT INTO "{table}" VALUES(?,?,?,?,?,?,?,?)',
+                [(i,1,100+i,1,1_700_000_000+i,'fixture replay',None,i) for i in range(6,2507)])
+        original_checkpoint=checkpoint
+        worker.request.update(checkpoint=checkpoint,wechat_read_images=False)
+        with patch.object(WeChatMediaRetries,'collect',side_effect=FAIL):
+            first_batch,partial=worker.wechat()
+            assert len(first_batch['messages'])==2000 and first_batch['more']
+            worker.request['checkpoint']=partial
+            second_batch,complete=worker.wechat()
+        expected=set(range(1,2507))-{5}
+        assert {m['local_id'] for m in first_batch['messages']+second_batch['messages']}==expected
+        assert not second_batch['more'] and all(c['last']==2506 for c in complete['cursors'].values())
+        fresh=FixtureReader(reader.path);store=Store(folder/'replay-store.sqlite3')
+        with patch.object(incremental_wechat,'Store',return_value=store), \
+             patch.object(incremental_wechat,'checked_open',side_effect=lambda r,rel:r._open(rel)):
+            cold=incremental_wechat.export_delta(fresh,metadata,
+                dict(checkpoint=original_checkpoint,conversations=None,bootstrap_since=0),False,read_images=False)
+        assert {m['local_id'] for m in cold['messages']}==expected
 
 
 def check_settings(folder):

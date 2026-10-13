@@ -10,7 +10,7 @@ from urllib.request import urlopen
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from chatlocal.config import local_path
-from reader_patches import patch_qq_proxy,patch_wechat_db,patch_qq_helper,patch_wechat_media
+from reader_patches import patch_qq_proxy,patch_wechat_db,patch_qq_helper,patch_wechat_media,patch_qq_blank_text
 
 QQ_COMMIT='b55675779e50edec913fab9d891e4185c8f7c9ac'
 WX_COMMIT='492a8fb70b95865613d6d8d9740323233dbfa197'
@@ -43,6 +43,7 @@ def download(job):
         if data.count(original)!=2:
             raise ValueError('Upstream QQ reader changed; review text truncation patch')
         data=data.replace(original,b'return " ".join(out)')
+        data=patch_qq_blank_text(data)
         # macOS accounts are opaque names. Tulpa's private snapshots retain
         # the Windows-compatible nt_qq/nt_db layout, which must be discoverable
         # alongside the Mac client's native nt_db layout.

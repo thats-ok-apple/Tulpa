@@ -65,6 +65,16 @@ def encrypted_view(folder):
     wal.write_bytes(header+struct.pack('>II', *checksum)+frame+header[16:24]+struct.pack('>II', *end)+encrypted)
     with ReadView(source, key, 'qq') as view:
         assert list(view.db.execute('SELECT value FROM fixture'))[0][0].count('update') == 1
+        saved_wal=wal.read_bytes()
+        with wal.open('ab') as stream:stream.write(b'partial-next-frame')
+        view.view.assert_fresh()
+        assert list(view.db.execute('SELECT value FROM fixture'))[0][0].count('update') == 1
+        with wal.open('r+b') as stream:
+            stream.seek(16);stream.write(b'new-salt')
+        try:view.view.assert_fresh()
+        except SourceBusy:pass
+        else:raise AssertionError('WAL generation reset accepted')
+        wal.write_bytes(saved_wal)
         with source.open('r+b') as stream:
             stream.seek(1024+(262144-1)*4096);stream.write(b'\0'*4096)
         try:view.view.assert_fresh()

@@ -1,5 +1,18 @@
 """Small reproducible adaptations to the pinned, read-only upstream modules."""
 
+def patch_qq_blank_text(data):
+    begin=data.index(b'def _extract_msg_text(')
+    end=data.index(b'\ndef _extract_qq_attachment_meta(',begin)
+    block=data[begin:end]
+    before=b'    return " ".join(out)\n'
+    if block.count(before)!=1:
+        raise ValueError('QQ text decoder changed; review blank-text preservation')
+    after='''    # Native text elements can contain only whitespace (for example, an
+    # @mention envelope). Preserve the row without promoting metadata to text.
+    return " ".join(out) if out else "[空白文本]" if any(parts) else ""
+'''.encode('utf-8')
+    return data[:begin]+block.replace(before,after)+data[end:]
+
 def patch_qq_proxy(data):
     before=b'    return [sys.executable, "-I", "-u", str(helper), *arguments]'
     after=b'''    # Desktop has a separately pinned stdlib-only Python/SQLite process.

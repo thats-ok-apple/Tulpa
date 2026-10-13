@@ -114,7 +114,10 @@ class QQMedia:
         if reply and len(reply_identity)==3:reply['_native_quote']=reply_identity
         # Mixed messages can repeat the same element wrapper; retain distinct images.
         unique={json.dumps(x,sort_keys=True):x for x in images}
-        return ' '.join(texts),list(unique.values())[:16],reply
+        text=' '.join(texts)
+        if texts and any(texts) and not text.strip() and not unique and not reply:
+            text='[空白文本]'
+        return text,list(unique.values())[:16],reply
 
 
 def resolve_qq_quote(db,spec,peer,reply):

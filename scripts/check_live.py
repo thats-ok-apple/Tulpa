@@ -48,6 +48,7 @@ def independent_import_scope(root):
             return dict(ok=True,payload=dict(messages=[]),checkpoint=dict(account='test',cursors={'tail':[10,20]}),
                         observed_at=time.time(),metrics={})
         with patch('chatlocal.live.wake_signature',return_value=('test',('unchanged',))), \
+             patch('scripts.incremental_common.bootstrap_time',return_value=int(time.time())-300), \
              patch('chatlocal.live.message_commit_lock',side_effect=nullcontext), \
              patch.object(manager,'client_running',return_value=True), \
              patch.object(manager,'worker',return_value=SimpleNamespace(read=read)),patch.object(manager,'log'):
@@ -145,6 +146,18 @@ def main():
         try:boundary(db,'native','local_id',['server_id','create_time'],after,allow_server_ack=True)
         except ValueError:pass
         else:raise AssertionError('Reused server identity accepted')
+        db.execute('UPDATE native SET server_id=20')
+        db.execute('INSERT INTO native VALUES(8,40,124)')
+        db.execute('DELETE FROM native WHERE local_id=7')
+        try:boundary(db,'native','local_id',['server_id','create_time'],after)
+        except ValueError:pass
+        else:raise AssertionError('Missing boundary silently advanced')
+        recovered=boundary(db,'native','local_id',['server_id','create_time'],after,replay_missing=True)
+        assert recovered.pop('replay_from')==0 and recovered['last']==8
+        db.execute('DELETE FROM native WHERE local_id=8')
+        try:boundary(db,'native','local_id',['server_id','create_time'],after,replay_missing=True)
+        except ValueError:pass
+        else:raise AssertionError('Sequence rewind silently accepted')
         db.close()
     print('PASS: import/live scope independence, legacy cursor migration, live-disable cancellation, atomic cursor rollback, hot/cold dedup, QQ/WeChat acknowledgements, native aliases, ID/content conflict rejection, deletion tombstones, settings persistence, WeChat identity. Synthetic only.')
 
