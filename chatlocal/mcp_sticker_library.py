@@ -153,9 +153,10 @@ class StickerLibrary:
             extra = len(raw)-(old[0] if old else 0)
             if used+extra>self.policy['scope_mib']*1024**2 or total+extra>self.policy['total_mib']*1024**2:
                 return dict(state='FAILED',code='local_capacity',note='本地图库已达容量上限；已有原件未被删除。')
-            path.parent.mkdir(parents=True,exist_ok=True);temp = path.parent/(uuid.uuid4().hex+'.tmp')
+            path.parent.mkdir(parents=True,exist_ok=True,mode=0o700);temp = path.parent/(uuid.uuid4().hex+'.tmp')
             try:
-                temp.write_bytes(raw);os.replace(temp,path)
+                with os.fdopen(os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:stream.write(raw)
+                os.replace(temp,path)
                 db.execute("UPDATE sticker_library SET local_bytes=?,availability='local' WHERE grant_id=? AND account=? AND digest=?",(len(raw),gid,account,item['digest']))
             finally:temp.unlink(missing_ok=True)
         return dict(state='SAVED',bytes=len(raw),sha256=item['digest'])

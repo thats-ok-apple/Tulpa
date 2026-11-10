@@ -42,20 +42,22 @@ macOS 若显示 Python 访问“文稿”或“其他 App 数据”的系统提�
 
 ## 连接外部 Agent
 
-在“外部 Agent / MCP”中选择平台、会话、时间与所需权限，创建连接并使用界面的客户端配置。可在资料首次导入前明确授权全部会话的只读连接；首次导入后固定来源账号，之后账号变化仍须重新授权。发送及群管理权限由用户另外开启。
+在“外部 Agent / MCP”中选择平台、会话、时间与所需权限，创建连接并使用界面的客户端配置。先导入需要授权的历史资料。连接绑定来源账号，账号变化后须重新授权。发送及群管理权限由用户另外开启。
 
 保持 Tulpa 运行，在已加载连接的 Codex 新聊天中说“用 Tulpa MCP 查询我的聊天……”即可。关闭 Tulpa 会停止本机服务，当前没有菜单栏后台模式或开机启动。外部模型、语音/OCR/Office 可选组件及 OneBot 需要另外配置。
 
+已有其他 QQ 机器人时，可用独立端口和 Codex 连接名称测试预览版，例如 MCP 端口 `18778` 和名称 `tulpa_mac_preview`。优先创建仅允许历史读取的连接。实时回复由各机器人独立处理，同一账号和会话应只开启一个自动回复入口。
+
 ## 验证
 
-合成加密数据库覆盖 Mac QQ 大文件、溢出页、WAL、只读约束、源变化及损坏页拒绝；微信测试覆盖账号隔离、缓存验证、增量游标和关闭图片处理。原生桌面、真实本机 QQ/微信导入、文字增量监听及 Codex MCP 查询在 0.5.2 基础上验证；当前源码已适配 0.5.5，并在该版本重新运行隔离检查。未验证 Intel Mac 和独立可分发安装包。
+合成加密数据库覆盖 Mac QQ 大文件、溢出页、WAL、只读约束、源变化及损坏页拒绝；微信测试覆盖账号隔离、缓存验证、增量游标和关闭图片处理。原生桌面、真实本机 QQ/微信导入、文字增量监听及 Codex MCP 查询在 0.5.2 基础上验证；当前源码以 0.5.7 为基础。未验证 Intel Mac 和独立可分发安装包。
 
 ```sh
 .venv/bin/python macos/check_readers.py
 .venv/bin/python scripts/check_wechat_macos.py
 .venv/bin/python scripts/check_wechat_no_images.py
 .venv/bin/python scripts/check_wechat_read_preferences.py
-.venv/bin/python macos/check_pending_mcp.py
+.venv/bin/python scripts/check_mcp.py
 node macos/check_ui.cjs
 ```
 

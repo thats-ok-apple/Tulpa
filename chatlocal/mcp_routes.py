@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 import anyio
 from fastapi import HTTPException, Request
 
-from .mcp_access import MCPAccess, AccessDenied
+from .mcp_access import MCPAccess, AccessDenied, GrantConflict, connection_body
 from .mcp_server import MCPService
 from .store import Store
 
@@ -15,6 +15,8 @@ def install_mcp_routes(app, store=None):
     access = MCPAccess(store)
     service = MCPService(access)
     app.state.tulpa_mcp = service
+    from tulpa_bilibili.web import install as install_bilibili
+    install_bilibili(app, service.tools.bilibili)
     previous = app.router.lifespan_context
 
     @asynccontextmanager
@@ -68,20 +70,69 @@ def install_mcp_routes(app, store=None):
     @app.post('/api/mcp/connections')
     def create(request: Request, body: dict):
         local(request, True)
+        from .mcp_qq_permissions import live_grant
         try:
+            body=connection_body(body)
             if not isinstance(body.get('platforms'),list) or any(p not in ('qq','wechat') for p in body['platforms']):
                 raise ValueError('请选择允许访问的平台。')
+            if 'history_platforms' in body and (not isinstance(body['history_platforms'],list) or any(p not in body['platforms'] for p in body['history_platforms'])):
+                raise ValueError('历史数据读取范围必须属于所选平台。')
             with store.connect() as db:
-                for platform in body.get('platforms',[]):
-                    if platform=='qq' and body.get('chat') is True and body.get('send') is True:continue
-                    if not db.execute('SELECT 1 FROM messages WHERE platform=? LIMIT 1',(platform,)).fetchone() and body.get('allow_future_imports') is not True:
+                for platform in body.get('history_platforms',body.get('platforms',[])):
+                    if 'history_platforms' not in body and platform=='qq' and live_grant(body):continue
+                    if not db.execute('SELECT 1 FROM messages WHERE platform=? LIMIT 1',(platform,)).fetchone():
                         raise ValueError('请先导入所选平台的聊天，确认来源账号后再创建连接。')
-            return access.create(body)
+            result=access.create(body)
+            if body.get('qq_friends'):service.tools.chat.receiver.start()
+            return result
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
 
-    def token_for(body):
-        if set(body)!={'token'} or not isinstance(body['token'],str):raise HTTPException(400,'连接凭据字段无效。')
+    @app.put('/api/mcp/connections/{gid}')
+    def update_permissions(gid: str, request: Request, body: dict):
+        local(request, True)
+        try:return service.update_permissions(gid, body)
+        except GrantConflict as exc:raise HTTPException(409, str(exc)) from None
+        except ValueError as exc:raise HTTPException(400, str(exc)) from None
+
+    @app.put('/api/mcp/connections/{gid}/state')
+    def connection_state(gid: str, request: Request, body: dict):
+        local(request, True)
+        if set(body)!={'enabled'}:raise HTTPException(400,'连接开关无效。')
+        try:return service.set_connection_enabled(gid,body['enabled'])
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.delete('/api/mcp/connections/{gid}')
+    def delete_connection(gid: str, request: Request):
+        local(request, True)
+        return service.delete_connection(gid)
+
+    @app.get('/api/mcp/learning/accounts')
+    def learning_accounts(request: Request):
+        local(request)
+        groups=service.tools.chat.learning.local_libraries()
+        return dict(accounts=[dict(account=a,groups=sum(g['account']==a for g in groups)) for a in sorted({g['account'] for g in groups})])
+
+    @app.get('/api/mcp/learning/groups')
+    def learning_groups(request: Request, account: str):
+        local(request)
+        return dict(groups=[g for g in service.tools.chat.learning.local_libraries() if g['account']==account])
+
+    @app.get('/api/mcp/learning/library')
+    def local_library(request: Request, account: str, group: str):
+        local(request)
+        try:return service.tools.chat.learning.local_library(account,group)
+        except ValueError as exc:raise HTTPException(400,'本机没有这个账号和群的学习记录。') from exc
+
+    @app.post('/api/mcp/learning/library')
+    def change_local_library(request: Request, body: dict):
+        local(request,True)
+        if set(body)!={'account','group','change'} or not isinstance(body['change'],dict):raise HTTPException(400,'学习设置无效。')
+        try:return service.tools.chat.learning.local_library(body['account'],body['group'],body['change'])
+        except ValueError as exc:raise HTTPException(400,'未能保存，请检查条目和设置。') from exc
+
+    def token_for(body, *, extra=()):
+        if set(body)-{'token',*extra} or not isinstance(body.get('token'),str):raise HTTPException(400,'连接凭据字段无效。')
         try:return access.authorize(body['token'])
         except AccessDenied as exc:raise HTTPException(400,str(exc)) from None
 
@@ -99,11 +150,11 @@ def install_mcp_routes(app, store=None):
 
     @app.post('/api/mcp/connections/{gid}/codex')
     def connect_codex(gid:str,request:Request,body:dict):
-        local(request,True);grant=token_for(body)
+        local(request,True);grant=token_for(body,extra=('server_name',))
         if grant['id']!=gid:raise HTTPException(403)
         if not service.status()['running']:raise HTTPException(400,'请先启动本机 MCP 服务。')
         from .mcp_connect import install_codex
-        try:return install_codex(service.status()['url'],body['token'],scope=grant['scope'])
+        try:return install_codex(service.status()['url'],body['token'],scope=grant['scope'],server_name=body.get('server_name','tulpa'))
         except ValueError as exc:raise HTTPException(409,str(exc)) from None
         except OSError:raise HTTPException(400,'无法写入本机 Codex 配置，请使用复制配置方式。') from None
 
@@ -178,9 +229,21 @@ def install_mcp_routes(app, store=None):
         from .onebot import Client
         try:
             client=Client(timeout=4); account=client.login()
-            rows=client.call('get_group_list', {})
+            rows=client.call('get_group_list', {'no_cache':True})
             return dict(items=[dict(platform='qq',conversation_id=f'{account}:group:{r["group_id"]}',name=str(r.get('group_name') or r['group_id']),count='OneBot')
                                for r in rows if isinstance(r,dict) and str(r.get('group_id','')).isdigit()])
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.get('/api/mcp/live-friends')
+    def live_friends(request: Request):
+        local(request)
+        from .onebot import Client
+        try:
+            client=Client(timeout=4); account=client.login()
+            rows=client.call('get_friend_list', {})
+            return dict(items=[dict(platform='qq',conversation_id=f'{account}:direct:{r["user_id"]}',
+                                    name=str(r.get('remark') or r.get('nickname') or r['user_id']),count='OneBot')
+                               for r in rows if isinstance(r,dict) and str(r.get('user_id','')).isdigit()])
         except ValueError as exc:raise HTTPException(400,str(exc)) from None
 
     @app.get('/api/mcp/chats/{sid}/learning')
@@ -213,14 +276,15 @@ def install_mcp_routes(app, store=None):
         except ValueError as exc:raise HTTPException(404,str(exc)) from None
 
     @app.get('/api/mcp/conversations')
-    def conversations(request: Request, query: str='', offset: int=0):
+    def conversations(request: Request, query: str='', offset: int=0, platform: str=''):
         local(request)
-        if len(query) > 100 or offset < 0:
+        if len(query) > 100 or offset < 0 or platform not in ('', 'qq', 'wechat'):
             raise HTTPException(400)
         with store.connect() as db:
             rows = [dict(r) for r in db.execute('''SELECT platform,conversation_id,max(conversation) name,count(*) count
-                FROM messages WHERE instr(lower(conversation),lower(?))>0
-                GROUP BY platform,conversation_id ORDER BY platform,name LIMIT 81 OFFSET ?''', (query, offset))]
+                FROM messages WHERE (instr(lower(conversation),lower(?))>0 OR instr(lower(conversation_id),lower(?))>0)
+                    AND (?='' OR platform=?)
+                GROUP BY platform,conversation_id ORDER BY platform,name LIMIT 81 OFFSET ?''', (query, query, platform, platform, offset))]
         return dict(items=rows[:80], has_more=len(rows)>80, next_offset=offset+80)
 
     return service

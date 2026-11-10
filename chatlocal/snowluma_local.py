@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import platform
 
 from .snowluma_secure import (ManagedError, atomic_json, file_lock, local_path,
                              private_directory, read_json, sha256)
@@ -17,6 +18,18 @@ from .snowluma_secure import (ManagedError, atomic_json, file_lock, local_path,
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def runtime_files(manifest):
+    if os.name=='nt':return manifest['required_files']
+    arch={'x86_64':'x64','AMD64':'x64','aarch64':'arm64','arm64':'arm64'}.get(platform.machine())
+    if platform.system()!='Linux' or not arch:
+        raise ManagedError('platform_unsupported','托管运行支持 Windows x64、Linux x64 和 ARM64。')
+    return manifest['linux_required_files'][arch]
+
+
+def runtime_node(root):
+    return local_path(Path(root)/('node.exe' if os.name=='nt' else 'node'))
 
 
 class LocalInstallation:
@@ -59,15 +72,20 @@ class LocalInstallation:
                         message='检测到已有配置。确认后自动核对并导入现有连接，不改密码、不重启服务。')
         if version != self.manifest['version']:
             raise ManagedError('unsupported_version', f'自动初始化支持 SnowLuma {self.manifest["version"]} 完整版；这个旧版本可通过已有连接导入。')
-        for name in self.manifest['required_files']:
+        for name in runtime_files(self.manifest):
             if not local_path(root/name).is_file():
-                raise ManagedError('package_incomplete', '缺少运行文件，请下载并完整解压 Windows x64 完整版（内置 Node.js），无需另装运行环境。')
+                raise ManagedError('package_incomplete', '缺少运行文件，请完整解压与当前系统和架构匹配的官方完整版（内置 Node.js）。')
         for doc in self.manifest['agreements']:
             if sha256(root/doc['file']) != doc['sha256']:
                 raise ManagedError('terms_changed', '所选包的协议内容与已适配版本不一致，尚未执行；请核对官方版本。')
-        with (root/'node.exe').open('rb') as stream:
-            if stream.read(2) != b'MZ':
-                raise ManagedError('runtime_invalid', '所选 Node.js 不是预期的 Windows 运行文件。')
+        with runtime_node(root).open('rb') as stream:
+            header=stream.read(20)
+            if os.name=='nt':valid=header[:2]==b'MZ'
+            else:
+                machine=183 if platform.machine() in ('aarch64','arm64') else 62
+                valid=(header[:6]==b'\x7fELF\x02\x01' and len(header)==20 and
+                       int.from_bytes(header[18:20],'little')==machine and os.access(runtime_node(root),os.X_OK))
+            if not valid:raise ManagedError('runtime_invalid','所选 Node.js 格式、执行权限或 CPU 架构与本机不符。')
         files = {}
         total = 0
         for base, directories, names in os.walk(root, followlinks=False):
@@ -115,6 +133,7 @@ class LocalInstallation:
             owner = dict(tulpa_root=str(self.directory.parent.parent), instance=instance)
             if marker and any(marker.get(k) != v for k,v in owner.items()):
                 raise ManagedError('owned_elsewhere', '文件夹已被另一连接占用，未修改配置。')
+            if os.name!='nt':private_directory(config)
             if not marker:
                 # Recheck after locking: another process could have initialized
                 # it since inspection. No implicit admin-password reset.

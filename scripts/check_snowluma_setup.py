@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from websockets.sync.server import serve
@@ -67,7 +69,7 @@ def main():
     http=ThreadingHTTPServer(('127.0.0.1',0),HTTP)
     thread=threading.Thread(target=http.serve_forever,daemon=True);thread.start();events=Events()
     try:
-        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='snow-setup-') as name,patch.dict('os.environ',{},clear=True):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='snow-setup-') as name,patch.dict('os.environ',isolated_env(),clear=True):
             root=Path(name);snow=root/'SnowLuma';product=root/'Tulpa';product.mkdir();snow.mkdir()
             write(snow/'package.json',dict(name='@snowluma/runtime',version='1.14.20'));(snow/'index.mjs').write_text('// fixture')
             h=dict(name='http-fixture',host='127.0.0.1',port=http.server_port,path='/custom/api',accessToken=HTTP.token)
@@ -176,7 +178,8 @@ def main():
             # Existing grants are checked without expanding or rewriting them.
             store=Store(root/'scope/messages.db');access=MCPAccess(store)
             with access.connect() as db:
-                db.execute('INSERT INTO grants VALUES(?,?,?,?,?,?,?,?)',('grant','fixture','hash','{}','epoch',json.dumps({'qq':'67890'}),0,0))
+                db.execute('INSERT INTO grants(id,name,token_hash,scope,epoch,accounts,created_at,revoked) VALUES(?,?,?,?,?,?,?,?)',
+                           ('grant','fixture','hash','{}','epoch',json.dumps({'qq':'67890'}),0,0))
             service=SimpleNamespace(access=access)
             try:check_account_scope(service,'12345')
             except SetupError as exc:assert exc.code=='scope_mismatch'

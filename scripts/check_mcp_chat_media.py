@@ -14,6 +14,7 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from check_mcp_chat import Events, OneBot, eventually, ROOT
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -21,6 +22,9 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from PIL import Image
+from types import SimpleNamespace
+import dns.message
+import dns.rrset
 from chatlocal.store import Store
 from chatlocal.mcp_routes import install_mcp_routes
 from chatlocal.mcp_chat_media import MEDIA_TOOLS, pixels, download, image_ref, public_addresses, MAX_BYTES
@@ -33,6 +37,12 @@ def fixture_image(animated=False):
     if animated:frames[0].save(out,'GIF',save_all=True,append_images=frames[1:],duration=150,loop=0)
     else:frames[0].save(out,'PNG')
     return out.getvalue()
+
+
+def dns_response(host,address):
+    response=dns.message.make_response(dns.message.make_query(host,'A'))
+    response.answer.append(dns.rrset.from_text(host.rstrip('.')+'.',60,'IN','A',address))
+    return dns.message.from_wire(response.to_wire())
 
 
 class StickerBot(OneBot):
@@ -74,12 +84,30 @@ def main():
     for url in ('file:///C:/secret','http://127.0.0.1/a','https://qq.com.evil.invalid/a','https://qpic.cn@evil.invalid/a'):
         try:download(url,threading.Event());raise AssertionError(url)
         except ValueError:pass
-    with patch('socket.getaddrinfo',return_value=[(socket.AF_INET,socket.SOCK_STREAM,6,'',('127.0.0.1',443))]):
+    with patch('dns.resolver.Resolver.resolve_name',return_value=SimpleNamespace(addresses=lambda:['127.0.0.1'])):
         try:download('https://qq.com/a',threading.Event());raise AssertionError('private DNS accepted')
         except ValueError:pass
+    # A valid public QQ hostname outside the image CDN list is still
+    # disallowed for a signed download, including after a redirect.
+    from chatlocal.qq_image_refs import clean_url
+    with patch('chatlocal.mcp_chat_media.public_addresses',return_value=[
+        (socket.AF_INET,socket.SOCK_STREAM,6,'',('175.27.35.211',443))
+    ]) as resolve, patch('chatlocal.mcp_chat_media.socket.socket'), \
+         patch('chatlocal.mcp_chat_media.ssl.create_default_context'), \
+         patch('chatlocal.mcp_chat_media.http.client.HTTPConnection') as connection:
+        response=connection.return_value.getresponse.return_value
+        response.status=302
+        response.getheader.return_value='https://qq.com/unapproved-image'
+        try:
+            download('https://gchat.qpic.cn/fixture',threading.Event(),
+                allowed_target=lambda target:target.scheme=='https' and clean_url(target.geturl()) is not None)
+            raise AssertionError('download followed an unapproved redirect')
+        except ValueError as exc:
+            assert '跳转目标不在允许范围内' in str(exc)
+        assert resolve.call_count==1 and resolve.call_args.args==('gchat.qpic.cn',443)
     for address in ('175.27.35.211','127.0.0.1'):
-        response=httpx.Client(transport=httpx.MockTransport(lambda request:httpx.Response(200,json={'Answer':[{'type':1,'data':address}]})),trust_env=False)
-        with patch('socket.getaddrinfo',return_value=[(socket.AF_INET,socket.SOCK_STREAM,6,'',('198.18.0.97',443))]),patch('chatlocal.mcp_chat_media.httpx.Client',return_value=response):
+        response=dns_response('multimedia.nt.qq.com.cn',address)
+        with patch('dns.resolver.Resolver.resolve_name',return_value=SimpleNamespace(addresses=lambda:['198.18.0.97'])),patch('dns.query.tls',return_value=response):
             if address.startswith('175.'):
                 assert public_addresses('multimedia.nt.qq.com.cn',443)[0][4][0]==address
             else:
@@ -91,7 +119,7 @@ def main():
     events=Events();upstream=ThreadingHTTPServer(('127.0.0.1',0),StickerBot)
     threading.Thread(target=upstream.serve_forever,daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='chat-media-') as tmp,patch.dict('os.environ',{},clear=True):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='chat-media-') as tmp,patch.dict('os.environ',isolated_env(),clear=True):
             folder=Path(tmp);store=Store(folder/'chats.sqlite3')
             (folder/'.env').write_text(f'REPLY_ONEBOT_URL=http://127.0.0.1:{upstream.server_port}\nREPLY_ONEBOT_WS_URL=ws://127.0.0.1:{events.port}\nREPLY_ONEBOT_WS_TOKEN=event-fixture\n','utf-8')
             app=FastAPI();svc=install_mcp_routes(app,store);access=svc.access;tools=svc.tools
@@ -168,11 +196,12 @@ def main():
                     assert data('collect_chat_sticker',**unknown)['state']=='UNKNOWN' and len(StickerBot.collected)==2
                     StickerBot.uncertain=False
                 # Stalled image requests cannot occupy ordinary tools, receive, or stop.
-                entered=threading.Barrier(3);release=threading.Event();eid=add(891)
-                def blocked(*args):entered.wait(3);release.wait(8);return animated
+                entered=threading.Event();release=threading.Event();eid=add(891)
+                def blocked(*args):entered.set();release.wait(8);return animated
                 with patch('chatlocal.mcp_chat_media.download',side_effect=blocked),ThreadPoolExecutor(2) as pool:
                     tasks=[pool.submit(call,'read_chat_image',session_id=sid,event_id=eid) for _ in range(2)]
-                    entered.wait(3)
+                    assert entered.wait(3)
+                    eventually(lambda:tools.chat.media.slots._value==0)
                     assert call('read_chat_image',session_id=sid,event_id=eid).structuredContent['error_code']=='media_busy'
                     began=time.monotonic();assert not call('get_data_status').isError;assert time.monotonic()-began<2
                     assert not call('send_chat_message',session_id=sid,text='ordinary still works',idempotency_key='ordinary-send').isError

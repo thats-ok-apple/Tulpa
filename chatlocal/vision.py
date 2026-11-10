@@ -47,15 +47,19 @@ def turn_vision_settings(config):
     return {k:v for k,v in resolved.items() if k.startswith('VISION_')}
 
 
-def frames_for(path):
+def frames_for(path, *, jpeg=False):
+    from .media import MAX_PIXELS
     frames=[]
     with Image.open(path) as image:
         total=getattr(image,'n_frames',1)
         for index in sorted({0,total//2,total-1}):
             image.seek(index)
+            if jpeg and image.width*image.height>MAX_PIXELS:raise ValueError('cache_corrupt')
             frame=ImageOps.exif_transpose(image.convert('RGB'))
             frame.thumbnail((1800,1800))
-            output=io.BytesIO();frame.save(output,format='PNG')
+            output=io.BytesIO()
+            if jpeg:frame.save(output,format='JPEG',quality=82)
+            else:frame.save(output,format='PNG')
             frames.append((index,output.getvalue()))
     return frames,total
 
@@ -92,6 +96,8 @@ class VisionProvider:
 
     def _ocr(self,frames):
         global _ocr
+        import onnxruntime
+        onnxruntime.disable_telemetry_events()
         from rapidocr import RapidOCR
         lines=[];scores=[]
         with _lock:

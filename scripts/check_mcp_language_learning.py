@@ -29,6 +29,21 @@ def review_fixture(task,*,reject=(),reason='原文固定用词支持该表达的
                              checks={k:i not in reject for k in CHECKS}) for i,e in enumerate(task['material']['expressions'])])
 
 
+def jargon_fixture(task,terms=('云朵开机',)):
+    from chatlocal.mcp_jargon_learning import CHECKS
+    messages=task['material']['messages']
+    return dict(jargon=[dict(term=term,source_id=next(m['source_id'] for m in messages if term in m['text']),
+        evidence_quote=next(m['text'][:240] for m in messages if term in m['text']),category='local_usage',
+        context_dependency='合成场景中用于特定活动，单看字面无法解释该用法',checks={k:True for k in CHECKS}) for term in terms])
+
+
+def meaning_fixture(task,meaning='合成群内开始工作的说法'):
+    material=task['material'];term=material['term']
+    m=next(m for g in material['evidence'] for m in g['messages'] if term in m['text'])
+    return dict(meaning=meaning,insufficient=False,reason='合成群友原话支持此用法',
+                usage_evidence=[dict(source_id=m['source_id'],quote=m['text'][:240])])
+
+
 def ground_fixture_rows(store,scope):
     """Explicit synthetic records for selection/count tests, never real data."""
     from chatlocal.mcp_expression_evidence import VERSION
@@ -43,15 +58,26 @@ def main():
     assert Path(__import__('chatlocal.mcp_language_store',fromlist=['LanguageStore']).__file__).resolve()==ROOT/'chatlocal/mcp_language_store.py'
     clock = Clock()
     with tempfile.TemporaryDirectory(prefix='tulpa-language-') as tmp:
-        store = LanguageStore(Path(tmp)/'learning.sqlite3', clock=clock)
+        store = LanguageStore(Path(tmp)/'learning.sqlite3', clock=clock,policy=dict(hourly_calls=100))
         scope = 'qq:111:group:222'
         binding = dict(scope=scope, gid='grant-a', sid='session-a', epoch='connection-a')
         store.configure(binding, enabled=True, allow_degraded=True)
-        serial=0
+        serial=0;auto_inference=False
         def add(n, tag='sample', b=None):
             for i in range(n):
                 store.observe(b or binding, dict(source_id=f'{tag}-{i}', text=f'合成材料 云朵开机 {tag} {i}', at=clock(), peer=True))
-        def claim(b=None,context=None):return store.claim(b or binding,context or ('fresh-'+(b or binding)['gid']))
+        def claim(b=None,context=None):
+            # These legacy expression cases consume the new independent stage;
+            # scheduling order and rejection contracts have dedicated tests.
+            task=store.claim(b or binding,context or ('fresh-'+(b or binding)['gid']))
+            while task and (task['stage']=='extract_jargon' or auto_inference and task['stage'] in ('with_context','without_context','compare')):
+                if task['stage']=='extract_jargon':result=jargon_fixture(task)
+                elif task['stage']=='with_context':result=meaning_fixture(task)
+                elif task['stage']=='without_context':result=dict(meaning='',insufficient=True,reason='合成词无通常含义')
+                else:result=dict(is_similar=False,sufficient=True,reason='合成群友用法支持')
+                submit(task,result,b)
+                task=store.claim(b or binding,context or ('fresh-'+(b or binding)['gid']))
+            return task
         def submit(t,result,b=None,invocation=None):
             nonlocal serial
             serial+=1
@@ -64,7 +90,7 @@ def main():
         def extraction(t,tag='base',words=True):
             ids=[m['source_id'] for m in t['material']['messages']]
             return dict(expressions=[expression_fixture(t['material']['messages'][i],f'{tag} 情境 {i}',f'{tag} 抽象方式 {i}') for i in range(3)],
-                        jargon=[dict(term='云朵开机',source_id=ids[3])] if words else [])
+                        jargon=[])
         def finish(t,tag='base',b=None,accept=True):
             r=extraction(t,tag);submit(t,r,b)
             review=claim(b)
@@ -72,9 +98,14 @@ def main():
             assert len(review['material']['messages'])>=10
             return submit(review,review_fixture(review,reject=() if accept else (0,1,2)),b)
         def batch(tag='base',b=None):
+            nonlocal auto_inference
+            auto_inference=True
             clock.advance(31);add(10,tag+'-'+str(clock()),b)
-            t=claim(b);assert t and t['stage']=='extract',t
+            t=claim(b)
+            assert t and t['stage']=='extract',t
             finish(t,tag,b)
+            assert not claim(b)
+            auto_inference=False
             return t
         add(9)
         clock.advance(29)
@@ -137,21 +168,23 @@ def main():
         print(json.dumps(dict(fixture_expressions=71,cached_context_calls=100,cached_context_ms=round((time.perf_counter()-began)*1000,2),
                               max_candidates=50,payload_chars=len(json.dumps(vector)),remote_calls=0)))
 
-        # Count jumped from 2 to 5: infer current count once, not each threshold.
+        # First milestone can now finish before expression backlog drains.
+        # Exercise the next milestone with the retained peer evidence.
+        with store.db() as db:db.execute('UPDATE jargon SET count=8 WHERE scope=?',(scope,))
         t=claim();assert t['stage']=='with_context'
         assert t['material']['term']=='云朵开机'
-        submit(t,dict(meaning='开始进入工作状态的群内戏称',insufficient=False,reason='反复出现在开始做事时'))
+        submit(t,meaning_fixture(t))
         plain=claim();assert plain['stage']=='without_context' and set(plain['material'])=={'term'}
         submit(plain,dict(meaning='',insufficient=True,reason='普通词典未确定'))
         compare=claim();assert compare['stage']=='compare'
         submit(compare,dict(is_similar=False,sufficient=True,reason='合成上下文支持特别用法'))
         word=store.status(binding,records=True)['jargon'][0]
-        assert word['last_inference_count']==5 and word['is_jargon'] and not claim()
+        assert word['last_inference_count']==8 and word['is_jargon'] and not claim()
         assert len(store.context(binding,'plan-word',['今天云朵开机'],'intent')['jargon'])==1
         assert store.context(binding,'plan-no-word',['无关'],'intent')['jargon']==[]
         print('PASS expression review/count/weighted/vector caps/selection; jargon extraction/context/three stages')
 
-        # Scope isolation, including a reused host context and foreign sources.
+        # Libraries stay separate even when one credential/host visits both.
         other=dict(binding,scope='qq:111:group:223',gid='grant-beta',sid='session-beta')
         second=dict(binding,scope='qq:999:group:222',gid='grant-other-account',sid='session-other')
         for b in (other,second):
@@ -162,8 +195,11 @@ def main():
                 with store.db() as db:db.execute("DELETE FROM expressions WHERE id='foreign-vector'")
             assert store.status(b,records=True)['expressions']==[] and store.status(b,records=True)['jargon']==[]
             assert store.context(b,'blank-'+b['gid'],['云朵开机'],'intent')['jargon']==[]
-        rejected('new_host_context_required',lambda:store.claim(other,'fresh-grant-a'))
-        rejected('new_host_context_required',lambda:store.configure(dict(binding,scope=other['scope']),enabled=True))
+        assert store.claim(other,'fresh-grant-a') is None
+        shared=dict(other,gid=binding['gid'],sid='shared-connection-other-group')
+        store.configure(shared,enabled=True)
+        assert store.status(shared)['expression_count']==0
+        rejected('scope_unavailable',lambda:store.configure(dict(binding,scope=other['scope']),enabled=True))
         rejected('task_unavailable',lambda:submit(task,r,second))
         add(10,'b',second);clock.advance(30);bt=claim(second);bad=extraction(bt);bad['expressions'][0]['source_id']=task['material']['messages'][0]['source_id']
         rejected('invalid_source',lambda:submit(bt,bad,second))
@@ -171,6 +207,7 @@ def main():
         rejected('task_unavailable',lambda:submit(bt,extraction(bt),second))
         saved=store.status(binding,records=True)
         store.cancel();binding['epoch']='connection-restored'
+        store.attach(binding)
         assert store.status(binding,records=True)['expressions']==saved['expressions']
         assert store.context(binding,'restore',['云朵开机'],'intent')['jargon']
         print('PASS A/alpha → A/beta empty → B/alpha empty → foreign and late denied → A/alpha preserved')
@@ -193,7 +230,7 @@ def main():
         store.submit(binding,retry['job_id'],retry['lease'],'timeout-2',failure='invalid_json')
         assert not claim()
         clock.advance(31);add(10,'restart');pending=claim();assert pending
-        store=LanguageStore(store.path,clock=clock)
+        store=LanguageStore(store.path,clock=clock,policy=dict(hourly_calls=100))
         rejected('task_unavailable',lambda:submit(pending,extraction(pending)))
         assert store.status(binding,records=True)['expressions']==saved['expressions']
         clock.advance(31);add(10,'expire');pending=claim();clock.advance(86401)
@@ -208,14 +245,17 @@ def main():
         # direct synthetic fixtures for counting edge states, not real learning.
         with store.db() as db:
             jid=word['id']
+            # Isolate this synthetic milestone matrix from the earlier 4/8
+            # scheduling scenario; production never resets this ledger.
+            db.execute("DELETE FROM jobs WHERE item_id=? AND kind='jargon'",(jid,))
             db.execute('UPDATE jargon SET last_inference_count=0,count=4 WHERE id=?',(jid,))
         for count in (4,8,25,100):
             clock.advance(31)
             # Fresh batch supplies real bounded fixture evidence at each stage.
+            with store.db() as db:db.execute('UPDATE jargon SET count=? WHERE id=?',(count-1,jid))
             add(10,'milestone'+str(count));t=claim();finish(t,'milestone'+str(count))
-            with store.db() as db:db.execute('UPDATE jargon SET count=? WHERE id=?',(count,jid))
             t=claim();assert t and t['stage']=='with_context',t
-            submit(t,dict(meaning='合成释义',insufficient=False,reason='合成证据'))
+            submit(t,meaning_fixture(t))
             t=claim();submit(t,dict(meaning='通常意义',insufficient=False,reason='通常语义'))
             t=claim();submit(t,dict(is_similar=False,sufficient=True,reason='特定语义不同'))
             word=next(x for x in store.status(binding,records=True)['jargon'] if x['id']==jid)
@@ -228,10 +268,10 @@ def main():
         assert store.status(binding,records=True)['jargon'][0]['meaning']=='人工固定定义'
         # A human correction arriving during the model's compare stage wins.
         with store.db() as db:
-            db.execute("INSERT INTO jargon(id,scope,term,folded,count,updated) VALUES('manual-race',?,'合成待核词','合成待核词',4,?)",(scope,clock()))
+            db.execute("INSERT INTO jargon(id,scope,term,folded,count,updated) VALUES('manual-race',?,'合成材料','合成材料',4,?)",(scope,clock()))
             db.execute("INSERT INTO jargon_evidence SELECT scope,'manual-race',batch_id,expires,body FROM jargon_evidence WHERE item_id=?",(jid,))
         t=claim();assert t['stage']=='with_context'
-        submit(t,dict(meaning='模型旧释义',insufficient=False,reason='fixture'))
+        submit(t,meaning_fixture(t))
         t=claim();submit(t,dict(meaning='通常意义',insufficient=False,reason='fixture'))
         t=claim();assert t['stage']=='compare'
         store.manage(binding,'jargon','manual-race',meaning='人工新释义')

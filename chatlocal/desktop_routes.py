@@ -141,7 +141,12 @@ def install_desktop_routes(app,root=ROOT):
         local(request,True)
         try:
             if action=='inspect' and set(body)=={'folder'}:result=managed.inspect(body['folder'])
+            elif action=='docker-inspect' and not body:result=managed.docker.inspect()
+            elif action=='docker-start':result=managed.docker.begin(body)
+            elif action=='docker-login' and not body:result=managed.docker.login()
+            elif action=='docker-logs' and not body:result=managed.docker.logs()
             elif action=='start':result=managed.begin(body)
+            elif action=='automatic':result=managed.begin_automatic(body)
             elif action=='select' and set(body)=={'choice_id'}:result=managed.select(body['choice_id'])
             elif action=='retry' and not body:result=managed.retry()
             elif action in ('cancel','revoke') and not body:result=managed.cancel(revoke=action=='revoke')

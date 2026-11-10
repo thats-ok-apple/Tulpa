@@ -209,6 +209,92 @@ def check_media(folder, wx):
         assert decoder._scan_aes_key() is None
 
 
+def check_kvcomm_media(folder):
+    from types import SimpleNamespace
+    from datetime import datetime
+    from Crypto.Cipher import AES
+    from PIL import Image
+    import reader_media
+    from chatlocal import media as image_cache
+    uin=123456789
+    wxid='wxid_synthetic'
+    account=wxid+'_'+hashlib.md5(str(uin).encode()).hexdigest()[:4]
+    documents=folder/'kv-test/Documents'
+    root=documents/'xwechat_files'/account
+    (root/'db_storage').mkdir(parents=True)
+    kv=documents/'app_data/net/kvcomm'
+    kv.mkdir(parents=True)
+    wrong=kv/'key_1_fixture.statistic'
+    wrong.write_text('')
+    now=int(time.time()); chat='fixture@chatroom'; digest='a'*32
+    image=io.BytesIO(); Image.new('RGB',(20,12),'red').save(image,'JPEG')
+    jpeg=image.getvalue()
+    key=hashlib.md5((str(uin)+wxid).encode()).hexdigest()[:16]
+    cipher=AES.new(key.encode(),AES.MODE_ECB).encrypt(jpeg[:16]+bytes([16])*16)
+    target=root/'msg/attach'/hashlib.md5(chat.encode()).hexdigest()/datetime.fromtimestamp(now).strftime('%Y-%m')/'Img'/(digest+'_h.dat')
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'\x07\x08V2\x08\x07'+struct.pack('<II',16,2)+b'\0'+cipher+jpeg[16:-2]+bytes(v^(uin & 255) for v in jpeg[-2:]))
+    reader=SimpleNamespace(account=account,wxid=wxid,cfg_dword=None,_find_weixin_pids=lambda: (_ for _ in ()).throw(AssertionError('Unexpected process enumeration')))
+    raw=dict(type_code=3,chat=chat,md5=digest,create_time=now,content='')
+    local=folder/'kv-image-cache'
+    with patch.object(reader_media,'DATA',local),patch.object(image_cache,'DATA',local):
+        media=reader_media.WeChatMedia(reader,dict(source_db=str(root/'db_storage')),live=True)
+        assert media.parse(raw)[1][0]['status']=='unavailable'
+        (kv/f'key_{uin}_fixture.statistic').write_text('')
+        assert media.parse(raw)[1][0]['status']=='available'
+        from chatlocal import image_recheck, sync
+        from chatlocal.store import Store
+        from threading import Event
+        store=Store(local/'fixture.sqlite3')
+        src=local/'message.json'
+        src.write_text(json.dumps([dict(platform='wechat',conversation_id=chat,
+            conversation_type='group',conversation='fixture',sender='fixture',
+            sender_id='fixture',source_id='1',timestamp=now*1000,content='[图片]',
+            media=[image_cache.unavailable(md5=digest)])]))
+        store.import_file(src)
+        with store.connect() as db:
+            mid=db.execute('SELECT id FROM messages').fetchone()[0]
+            db.execute('INSERT INTO message_native_ids VALUES(?,?,?,?)',
+                ('wechat',chat,json.dumps(['wxid_other','message/message_0.db','Msg_fixture',1]),mid))
+        (local/'.tmp').mkdir()
+        with patch('scripts.refresh_media.parser_for',return_value=(media,account)) as parser,patch.object(sync,'ROOT',local):
+            row=store.message(mid)
+            assert image_recheck.recheck(store,row,0,Event())['status']=='unavailable'
+            with store.connect() as db:
+                db.execute('UPDATE message_native_ids SET locator=? WHERE message_id=?',
+                    (json.dumps([wxid,'message/message_0.db','Msg_fixture',1]),mid))
+                db.execute("INSERT OR REPLACE INTO client_settings VALUES('live_ingestion',?)",
+                    (json.dumps(dict(wechat_read_images=False)),))
+            parser.reset_mock()
+            assert image_recheck.recheck(store,row,0,Event())['status']=='unavailable'
+            parser.assert_not_called()
+            with store.connect() as db:
+                db.execute("DELETE FROM client_settings WHERE name='live_ingestion'")
+            assert image_recheck.recheck(store,row,0,Event())['sha256']==hashlib.sha256(jpeg).hexdigest()
+            assert store.message(mid)['media'][0]['status']=='available'
+            parser.assert_called_once_with('wechat',False,live=True)
+        media=reader_media.WeChatMedia(reader,dict(source_db=str(root/'db_storage')),live=False)
+        assert media.parse(raw)[1][0]['status']=='available'
+        # An existing valid AES key must not cause a guessed, wrong XOR key to
+        # override the account-bound derived XOR. Check full recovered bytes.
+        keys=local/'wechat-reader/work/image_keys.json';keys.parent.mkdir(parents=True,exist_ok=True)
+        keys.write_text(json.dumps({account:key}))
+        from wechatauto.media import MediaDownloader
+        with patch.object(MediaDownloader,'_derive_xor_key',return_value=0),patch.object(MediaDownloader,'_install_xor_key',return_value=0):
+            for live in (True,False):
+                media=reader_media.WeChatMedia(reader,dict(source_db=str(root/'db_storage')),live=live)
+                item=media.parse(raw)[1][0]
+                assert item['status']=='available' and item['sha256']==hashlib.sha256(jpeg).hexdigest()
+        media.account='wxid_other_ffff'
+        assert media.macos_image_key(target) is None
+        media.account=account;media.wxid='wxid_other'
+        assert media.macos_image_key(target) is None
+        media.wxid=wxid
+        other=root.parent/'wxid_other_ffff'; other.mkdir()
+        media.root=other; media.key=None; media.cache={}
+        assert media.macos_image_key(target) is None
+
+
 def main():
     assert sys.platform == 'darwin', 'This check verifies the native Mac adapter'
     fail = AssertionError('Mac module import touched Windows APIs')
@@ -226,6 +312,7 @@ def main():
             check_cache(folder, wx)
             check_master(folder, wx)
             check_media(folder, wx)
+            check_kvcomm_media(folder)
     print('PASS: native Mac import/discovery; page1 HMAC; read-only synthetic decrypt; account-bound cache isolation; wrong/invalid keys; master-to-per-database derivation; media caches and no Windows recovery. No real client or chats.')
 
 

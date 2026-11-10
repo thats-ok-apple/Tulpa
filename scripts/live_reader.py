@@ -24,6 +24,35 @@ from live_vfs import ReadView, SourceBusy, family_stamp, configure_qq_worker
 from incremental_common import boundary
 
 
+def wechat_boundary(db, table, prior, file_ack, imported_boundary):
+    """Replay a changed, unsupported boundary without skipping later rows.
+
+    Calls and other unsupported rows still advance the native cursor, but can
+    change after being written. Replay the conversation, retaining the normal
+    transactional identity checks for every importable row. A rewind remains
+    an error and a changed supported row still requires a verified file ack.
+    """
+    try:
+        return boundary(db, table, 'local_id', ['server_id', 'create_time'], prior,
+                        allow_server_ack=True, replay_missing=True)
+    except ValueError as exc:
+        if str(exc) != '源消息游标失效：数据库可能被替换或清理。请补读历史后重建同步进度。':
+            raise
+        if file_ack():
+            top = boundary(db, table, 'local_id', ['server_id', 'create_time'], None)
+            top['replay_from'] = prior['last'] - 1
+            return top
+        row = db.execute(f'SELECT local_type FROM "{table}" WHERE local_id=?',
+                         (prior['last'],)).fetchone() if prior and prior.get('last') else None
+        if row is None or (row[0] & 0xffffffff) in (1, 3, 34, 47, 49) or imported_boundary():
+            raise
+        top = boundary(db, table, 'local_id', ['server_id', 'create_time'], None)
+        if top['last'] < prior['last']:
+            raise ValueError('源消息序列倒退；请补读历史后重建同步进度。')
+        top['replay_from'] = 0
+        return top
+
+
 class Row(tuple):
     def __new__(cls, values, names):
         obj = super().__new__(cls, values)
@@ -133,6 +162,7 @@ class Reader:
         self.progress('cached_keys')
         import chatlog_keeper.qq_db as q
         from reader_media import QQMedia
+        read_images=not self.request.get('photo_on_demand',False)
         from qq_message_types import supported, is_reply_candidate
         meta = json.loads((DATA/'qq-snapshot-info.json').read_text(encoding='utf-8'))
         previous = self.request['checkpoint']
@@ -193,9 +223,9 @@ class Reader:
                     if not supported(row[12],row[10]) or (row[12] in (3,7) and not file): continue
                     parsed=None
                     if row[10]!=1 and not file and not voice:
-                        if self.media is None or self.media_stickers != self.request['load_stickers'] or time.monotonic()-self.media_at>30:
-                            self.media = QQMedia(q, meta['source'], load_stickers=self.request['load_stickers'])
-                            self.media_at=time.monotonic(); self.media_stickers=self.request['load_stickers']
+                        if self.media is None or self.media_stickers != self.request['load_stickers'] or self.media_read_images!=read_images or time.monotonic()-self.media_at>30:
+                            self.media = QQMedia(q, meta['source'], load_stickers=self.request['load_stickers'],read_images=read_images)
+                            self.media_at=time.monotonic(); self.media_stickers=self.request['load_stickers']; self.media_read_images=read_images
                         parsed=self.media.parse(row[4],row[10],row[1])
                         if is_reply_candidate(row[12],row[10]) and not parsed[2]:continue
                     if spec.conversation_type=='direct':
@@ -222,15 +252,17 @@ class Reader:
                 cursors[ck] = last if prior and len(rows)==2000 else current
                 if cursors[ck]!=current:more=True
         # Retry incomplete local attachments independently of native row cursors.
-        if self.media is None or self.media_stickers!=self.request['load_stickers']:
-            self.media=QQMedia(q,meta['source'],load_stickers=self.request['load_stickers'])
-            self.media_at=time.monotonic();self.media_stickers=self.request['load_stickers']
-        if self.media_retries is None:
-            from live_media import QQMediaRetries
-            self.media_retries=QQMediaRetries()
-        recovered,_=self.media_retries.collect(self.media,account,wanted,
-            exclude={(m['conversation_id'],m['source_id']) for m in messages})
-        messages.extend(recovered)
+        recovered=[]
+        if read_images:
+            if self.media is None or self.media_stickers!=self.request['load_stickers'] or self.media_read_images!=read_images:
+                self.media=QQMedia(q,meta['source'],load_stickers=self.request['load_stickers'],read_images=read_images)
+                self.media_at=time.monotonic();self.media_stickers=self.request['load_stickers'];self.media_read_images=read_images
+            if self.media_retries is None:
+                from live_media import QQMediaRetries
+                self.media_retries=QQMediaRetries()
+            recovered,_=self.media_retries.collect(self.media,account,wanted,
+                exclude={(m['conversation_id'],m['source_id']) for m in messages})
+            messages.extend(recovered)
         from qq_labels import conversation_labels
         label_ids=self.label_conversations|{m['conversation_id'] for m in messages} if refresh_labels else set()
         return dict(reader='qq-live-database',messages=messages,more=more,media_replays=len(recovered),
@@ -249,7 +281,7 @@ class Reader:
             self.reader=LiveWeChatDB(db_dir=str(Path(meta['source_db']).parent.parent),account=meta['account'],
                 workdir=str(DATA/'live/wechat'),keys_file=str(DATA/'wechat-reader/keys.json'))
         reader=self.reader
-        read_images=self.request.get('wechat_read_images',True)
+        read_images=self.request.get('wechat_read_images',True) and not self.request.get('photo_on_demand',False)
         if (self.media is None or self.media_stickers!=self.request['load_stickers']
                 or self.media_read_images!=read_images):
             self.media=WeChatMedia(reader,meta,load_stickers=self.request['load_stickers'],live=True,read_images=read_images)
@@ -270,6 +302,9 @@ class Reader:
         self.progress('directory')
         if not self.idx or time.monotonic()-self.maps_at>60:
             self.idx=reader._build_md5_index(); self.nicks=reader._nickname_index(); self.maps_at=time.monotonic()
+        import copy
+        from chatlocal.live_recovery import diagnosis, replay_issue
+        recovery=copy.deepcopy(previous.get('recovery',{}))
         cursors={};messages=[];chats={};more=False;pending_ack=False
         wanted=self.request.get('conversations')
         allowed={hashlib.md5(v.encode()).hexdigest() for v in wanted} if wanted is not None else None
@@ -285,17 +320,28 @@ class Reader:
                 if not re.fullmatch('Msg_[a-fA-F0-9]{32}',table): raise ValueError('schema_changed')
                 ck=rel.replace('\\','/')+'/'+table
                 prior=previous.get('cursors',{}).get(ck)
+                issue=recovery.get(ck,{})
+                if issue.get('status')=='blocked':
+                    if prior:cursors[ck]=prior
+                    continue
                 if len(messages)>=4000:
                     if prior:cursors[ck]=prior
                     more=True;continue
-                try:top=boundary(db,table,'local_id',['server_id','create_time'],prior,allow_server_ack=True)
-                except ValueError:
-                    # Upload completion can replace an already nonzero WX file
-                    # server ID. Replay only a locally verified acknowledgement;
-                    # Store revalidates it in the same transaction as the cursor.
-                    if not self.file_ack(reader,db,rel,table,prior,identities):raise
+                # File acknowledgements are independently verified against the
+                # imported message and revalidated by Store in the transaction.
+                try:
+                    top=wechat_boundary(db,table,prior,
+                        lambda:self.file_ack(reader,db,rel,table,prior,identities),
+                        lambda:self.imported_boundary(reader,rel,table,prior))
+                except ValueError as exc:
+                    if error_code(exc)!='sequence_reset':raise
+                    issue=replay_issue(issue,diagnosis(db,table,prior))
+                    recovery[ck]=issue
+                    if issue['status']=='blocked':
+                        cursors[ck]=prior
+                        continue
                     top=boundary(db,table,'local_id',['server_id','create_time'],None)
-                    top['replay_from']=prior['last']-1
+                    top['replay_from']=0
                 replay=top.pop('replay_from',prior['last'] if prior else 0)
                 cursors[ck]=top
                 if allowed is not None and table[4:] not in allowed: continue
@@ -306,11 +352,19 @@ class Reader:
                     if top['last'] and (not prior or top['last']>prior['last']): raise ValueError('conversation_unresolved')
                     continue
                 if user.startswith('gh_') or user in {'weixin','filehelper','newsapp','brandsessionholder','foldedchat'}: continue
+                pending_ids=set(prior.get('pending_ids',[])) if prior else set()
+                if pending_ids:
+                    existing=db.execute(f'SELECT local_id FROM "{table}" WHERE local_id IN ('+','.join('?' for _ in pending_ids)+')',sorted(pending_ids)).fetchall()
+                    pending_ids.intersection_update(r[0] for r in existing)
                 condition='local_id>?' if prior else 'create_time>=?'
                 value=replay if prior else self.request['since']
+                query_values=[value]
+                if pending_ids:
+                    condition='('+condition+' OR local_id IN ('+','.join('?' for _ in pending_ids)+'))'
+                    query_values+=sorted(pending_ids)
                 sql=f'''SELECT local_id,local_type,server_id,real_sender_id,create_time,message_content,packed_info_data,sort_seq
                   FROM "{table}" WHERE {condition} AND local_id<=? ORDER BY local_id LIMIT 2000'''
-                rows=db.execute(sql,(value,top['last'])).fetchall()
+                rows=db.execute(sql,(*query_values,top['last'])).fetchall()
                 pending=False
                 processed=[]
                 for row in rows:
@@ -319,7 +373,14 @@ class Reader:
                         # An outgoing row can appear before server acknowledgement.
                         # Do not invent a temporary live identity that becomes a
                         # duplicate when the server ID is assigned a moment later.
-                        pending=True;pending_ack=True;more=True;break
+                        # Persist the unresolved native locator, but let later
+                        # acknowledged messages in this conversation flow. It
+                        # is explicitly revisited even after the main cursor.
+                        pending=True;pending_ack=True
+                        pending_ids.add(row['local_id'])
+                        if len(pending_ids)>1000:raise ValueError('pending_ack_overflow')
+                        continue
+                    pending_ids.discard(row['local_id'])
                     processed.append(row)
                     if base not in (1,3,34,47,49): continue
                     message=reader._export_row(row,MSG_TYPE_NAMES)
@@ -334,13 +395,18 @@ class Reader:
                         if text is not None: message['text']=text
                         message.update(media=media,reply_to=reply)
                     messages.append(message);chats[user]=dict(username=user,name=self.nicks.get(user,user))
-                if pending and not processed:
-                    cursors[ck]=prior or dict(last=0,signature='')
-                elif processed and (pending or len(rows)==2000 and rows[-1]['local_id']<top['last']):
+                if processed and len(rows)==2000 and rows[-1]['local_id']<top['last']:
                     end=processed[-1]
                     signature=hashlib.sha256(json.dumps([end['server_id'],end['create_time']],default=str).encode()).hexdigest()
                     cursors[ck]=dict(last=end['local_id'],signature=signature);more=True
-        if set(previous.get('cursors',{}))-set(cursors): raise ValueError('shard_removed')
+                elif issue.get('status')=='replaying':
+                    recovery[ck]=dict(issue,status='recovered',updated_at=time.time(),next_retry_at=None)
+                if pending_ids:cursors[ck]['pending_ids']=sorted(pending_ids)
+        for missing in set(previous.get('cursors',{}))-set(cursors):
+            # Never discard a removed table's progress or block healthy shards.
+            cursors[missing]=previous['cursors'][missing]
+            recovery[missing]=dict(reason='source_table_removed',status='blocked',attempts=1,
+                updated_at=time.time(),next_retry_at=None,action='inspect_source_and_replay')
         # Messages may commit before their attachment files arrive. Retry a few
         # recent incomplete items even on a pass with no new native rows.
         recovered=[];recovered_chats={}
@@ -356,7 +422,19 @@ class Reader:
         for user,chat in recovered_chats.items():chats.setdefault(user,chat)
         return dict(reader='wechatauto-replica',wxid=reader.wxid,chats=list(chats.values()),messages=messages,
             identity_method='per-shard Name2Id + verified group prefix',
-            snapshot_at=datetime.now(timezone.utc).isoformat(),live=True,more=more,pending_ack=pending_ack,media_replays=len(recovered)),dict(account=meta['account'],cursors=cursors)
+            snapshot_at=datetime.now(timezone.utc).isoformat(),live=True,more=more,pending_ack=pending_ack,media_replays=len(recovered)),dict(account=meta['account'],cursors=cursors,recovery=recovery)
+
+    def imported_boundary(self,reader,rel,table,prior):
+        from chatlocal.config import DB
+        from contextlib import closing
+        import sqlite3
+        user=self.idx.get(table[4:])
+        if not user:return True  # Cannot establish the local identity safely.
+        locator=json.dumps([reader.wxid,rel.replace('\\','/'),table,prior['last']])
+        with closing(sqlite3.connect(f'file:{DB}?mode=ro',uri=True)) as local:
+            native=('wechat',user,locator)
+            return bool(local.execute('SELECT 1 FROM message_native_ids WHERE platform=? AND conversation_id=? AND locator=?',native).fetchone()
+                or local.execute('SELECT 1 FROM deleted_native_ids WHERE platform=? AND conversation_id=? AND locator=?',native).fetchone())
 
     def file_ack(self,reader,db,rel,table,prior,identities):
         if not prior or not prior.get('last'):return False
@@ -385,6 +463,17 @@ class Reader:
             return signature==prior['signature']
 
 
+def error_code(exc):
+    from chatlog_keeper.core._wal import WalValidationError
+    if isinstance(exc,(SourceBusy,WalValidationError)):return 'source_busy'
+    if isinstance(exc,ValueError):
+        if str(exc) in ('源消息游标失效：数据库可能被替换或清理。请补读历史后重建同步进度。',
+                        '源消息序列倒退；请补读历史后重建同步进度。'):
+            return 'sequence_reset'
+        if re.fullmatch('[a-z_]+',str(exc)):return str(exc)
+    return 'reader_failed'
+
+
 def main():
     output=sys.stdout
     def progress(stage):
@@ -397,9 +486,7 @@ def main():
             with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
                 result=reader.read(request)
         except Exception as exc:
-            from chatlog_keeper.core._wal import WalValidationError
-            code='source_busy' if isinstance(exc,(SourceBusy,WalValidationError)) else str(exc) if isinstance(exc,ValueError) and re.fullmatch('[a-z_]+',str(exc)) else 'reader_failed'
-            result=dict(ok=False,error=code,error_type=type(exc).__name__)
+            result=dict(ok=False,error=error_code(exc),error_type=type(exc).__name__)
         print(json.dumps(result,ensure_ascii=False),flush=True)
 
 

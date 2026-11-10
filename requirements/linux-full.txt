@@ -1,0 +1,6 @@
+-r linux.txt
+-r tui.txt
+-r linux-ocr.txt
+-r artifacts.txt
+numpy==2.5.3
+# Binary + model installation is a separate explicit component operation.

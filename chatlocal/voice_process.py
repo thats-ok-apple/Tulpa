@@ -15,8 +15,14 @@ class _Extended(ctypes.Structure):
 
 class ChildJob:
     def __init__(self,process,*,memory_bytes=2*1024**3):
-        self.process=process;self.handle=None
-        if os.name != 'nt':return  # macOS lifetime is managed by VoiceWorker._child.
+        self.process = process
+        if os.name != 'nt':
+            # Linux children are spawned by owned_popen with their own session,
+            # PDEATHSIG and RLIMIT_AS before exec, never preexec_fn in a thread.
+            self.handle = None
+            if os.getpgid(process.pid) != process.pid:
+                raise OSError('Voice child must own its process group')
+            return
         k=ctypes.WinDLL('kernel32',use_last_error=True);self.k=k;self.handle=None
         k.CreateJobObjectW.argtypes=[ctypes.c_void_p,wintypes.LPCWSTR];k.CreateJobObjectW.restype=wintypes.HANDLE
         k.SetInformationJobObject.argtypes=[wintypes.HANDLE,ctypes.c_int,ctypes.c_void_p,wintypes.DWORD];k.SetInformationJobObject.restype=wintypes.BOOL
@@ -28,4 +34,8 @@ class ChildJob:
         if not self.handle or not k.SetInformationJobObject(self.handle,9,ctypes.byref(info),ctypes.sizeof(info)) or not k.AssignProcessToJobObject(self.handle,wintypes.HANDLE(process._handle)):
             self.close();raise OSError('Could not bind local voice subprocess lifetime')
     def close(self):
+        if os.name != 'nt':
+            from .platform_process import terminate_group
+            terminate_group(self.process)
+            return
         if self.handle:self.k.CloseHandle(self.handle);self.handle=None

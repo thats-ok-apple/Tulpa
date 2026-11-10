@@ -21,6 +21,8 @@ def create_app():
     install_desktop_routes(app)
     install_mcp_routes(app)
     install_component_routes(app)
+    from chatlocal.cli_runtime import install as install_cli
+    install_cli(app)
     web=ROOT/'web'
 
     @app.get('/api/read-options')
@@ -41,7 +43,7 @@ def create_app():
 
     @app.get('/ui/{name}')
     def asset(name:str):
-        allowed={'app.css','desktop.css','snowluma.js','mcp.css','mcp.js','mcp-home.js','mcp-home.css','chat.js','data.js','live.js','voice.js','artifacts.js','tulpa-logo.png'}
+        allowed={'app.css','desktop.css','snowluma.js','mcp.css','mcp.js','mcp-home.js','mcp-home.css','mcp-learning.js','mcp-bilibili-login.js','chat.js','data.js','live.js','voice.js','artifacts.js','tulpa-logo.png'}
         if name not in allowed:raise HTTPException(404)
         return FileResponse(web/name,headers={'Cache-Control':'no-cache'})
     return app

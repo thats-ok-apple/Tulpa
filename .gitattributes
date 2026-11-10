@@ -2,3 +2,6 @@
 desktop/licenses/* -whitespace
 # Keep distributed prompt provenance stable across platforms.
 chatlocal/prompts/mcp_chat/* text eol=lf
+# Linux launchers must also survive archives produced on Windows.
+*.sh text eol=lf
+tulpa text eol=lf

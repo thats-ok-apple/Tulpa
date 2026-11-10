@@ -114,7 +114,8 @@ def atomic_bytes(path, raw):
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + '.tmp-' + secrets.token_hex(8))
         try:
-            with temp.open('xb') as f:
+            fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as f:
                 f.write(raw)
                 f.flush()
                 os.fsync(f.fileno())
@@ -151,7 +152,7 @@ class SecretVault:
     """DPAPI CurrentUser, UI forbidden. Upstream plaintext lives under inherited ACL."""
     def __init__(self, directory):
         self.directory = Path(directory)
-        self.path = self.directory / 'credentials.dpapi'
+        self.path = self.directory / ('credentials.dpapi' if os.name=='nt' else 'credentials.aead')
 
     @staticmethod
     def crypt(raw, decrypt=False):
@@ -181,11 +182,14 @@ class SecretVault:
     def read(self):
         local_path(self.path)
         if not self.path.exists():
+            previous=self.directory/('credentials.aead' if os.name=='nt' else 'credentials.dpapi')
+            if previous.exists():
+                raise ManagedError('credential_platform_mismatch','托管凭据属于另一系统，未生成替代密码。请保留原凭据，使用 SL 已有连接方式重新授权。')
             return {}
         try:
             if self.path.stat().st_size > 65536:
                 raise ValueError()
-            value = json.loads(self.crypt(self.path.read_bytes(), True))
+            value = json.loads(self._crypt(self.path.read_bytes(), True))
             if not isinstance(value, dict):
                 raise ValueError()
             return value
@@ -196,7 +200,33 @@ class SecretVault:
 
     def write(self, value):
         private_directory(self.directory)
-        atomic_bytes(self.path, self.crypt(json.dumps(value).encode()))
+        atomic_bytes(self.path, self._crypt(json.dumps(value).encode()))
+
+    def _crypt(self,raw,decrypt=False):
+        if os.name=='nt':return self.crypt(raw,decrypt)
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.exceptions import InvalidTag
+        key_path=local_path(self.directory/'vault.key')
+        try:
+            if not key_path.exists():
+                if decrypt or self.path.exists():raise ValueError()
+                private_directory(self.directory)
+                fd=os.open(key_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
+                with os.fdopen(fd,'wb') as f:f.write(secrets.token_bytes(32));f.flush();os.fsync(f.fileno())
+            for path in (key_path,self.path):
+                if path.exists():
+                    st=path.stat()
+                    if st.st_uid!=os.getuid() or st.st_mode&0o077:raise ValueError()
+            key=key_path.read_bytes()
+            if len(key)!=32:raise ValueError()
+            aead=AESGCM(key);associated=b'Tulpa SnowLuma credentials v1'
+            if decrypt:
+                if raw[:4]!=b'TSL1':raise ValueError()
+                return aead.decrypt(raw[4:16],raw[16:],associated)
+            nonce=secrets.token_bytes(12)
+            return b'TSL1'+nonce+aead.encrypt(nonce,raw,associated)
+        except (OSError,ValueError,InvalidTag):
+            raise ManagedError('credential_unavailable','Linux 托管凭据或本机密钥不可用；请恢复同一备份并确认文件权限为 600，未重置密码。') from None
 
 
 _locks_guard = threading.Lock()

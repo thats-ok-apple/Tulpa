@@ -34,30 +34,57 @@ class WeChatMediaRetries:
         if now<self.next_scan or wanted==[]:return [],{}
         self.next_scan=now+15
         result=[];chats={};attempted=0
-        with closing(sqlite3.connect(f'file:{self.path}?mode=ro',uri=True)) as db:
+        from chatlocal.image_index import register,retry_result
+        with closing(sqlite3.connect(self.path,timeout=10)) as db:
             db.row_factory=sqlite3.Row
+            db.execute('PRAGMA foreign_keys=ON')
             clause=' AND m.conversation_id IN ('+','.join('?' for _ in wanted)+')' if wanted is not None else ''
+            # Upgrade legacy rows incrementally; queue state survives worker restarts.
+            legacy=db.execute('''SELECT m.id,m.media_json,m.timestamp FROM messages m JOIN live_events e ON e.message_id=m.id
+                WHERE m.platform=? AND e.ingested_at>=? AND instr(m.media_json,'"unavailable"')>0'''+clause+' ORDER BY m.id DESC LIMIT 128',
+                (self.platform,now-86400,*(wanted or []))).fetchall()
+            for row in legacy:register(db,row['id'],json.loads(row['media_json']),row['timestamp'],now=now)
+            db.execute("UPDATE media_retry_jobs SET state='window_expired',reason_code=coalesce(reason_code,'source_missing') WHERE state='pending' AND deadline<?",(now,))
+            db.commit()
+            urgent=db.execute('''SELECT m.id,m.conversation_id,m.conversation,m.source_id,m.media_json
+                FROM messages m JOIN media_retry_jobs j ON j.message_id=m.id
+                WHERE m.platform=? AND j.state='pending' AND j.next_try<=? AND m.timestamp>=?
+                  AND instr(m.media_json,'"unavailable"')>0'''+clause+' ORDER BY m.id DESC LIMIT 2',
+                (self.platform,now,(now-86400)*1000,*(wanted or []))).fetchall()
+            urgent_ids={r['id'] for r in urgent}
             # Work only on incomplete media seen by realtime in the last day.
             # Paginate to prevent old unavailable files starving later messages.
             rows=db.execute('''SELECT m.id,m.conversation_id,m.conversation,m.source_id,m.media_json
-                FROM messages m JOIN live_events e ON e.message_id=m.id
-                WHERE m.platform=? AND e.ingested_at>=? AND m.id>?
+                FROM messages m JOIN media_retry_jobs j ON j.message_id=m.id
+                WHERE m.platform=? AND j.state='pending' AND j.next_try<=? AND m.id>?
                   AND instr(m.media_json,'"unavailable"')>0'''+clause+' ORDER BY m.id LIMIT 128',
-                (self.platform,now-86400,self.after,*(wanted or []))).fetchall()
+                (self.platform,now,self.after,*(wanted or []))).fetchall()
+            rows=list(urgent)+[r for r in rows if r['id'] not in urgent_ids]
             for row in rows:
-                self.after=row['id']
+                if row['id'] not in urgent_ids:self.after=row['id']
                 if (row['conversation_id'],row['source_id']) in exclude:continue
-                deadline,tries=self.backoff.get(row['id'],(0,0))
-                if now<deadline:continue
                 if not any(i.get('status')=='unavailable' and (media.load_stickers or i.get('kind')=='image')
                            for i in json.loads(row['media_json'])):continue
                 attempted+=1
-                self.backoff[row['id']]=(now+min(300,15*2**min(tries,5)),tries+1)
-                if len(self.backoff)>512:self.backoff.pop(next(iter(self.backoff)))
                 raw=self.original(db,row,wxid)
-                if raw and (recovered:=self.recover(media,raw)):
-                    result.append(recovered)
-                    chats[row['conversation_id']]=dict(username=row['conversation_id'],name=row['conversation'])
+                if raw is None:
+                    attempted-=1
+                    continue
+                if raw:
+                    try:recovered=self.recover(media,raw)
+                    except (OSError,ValueError,RuntimeError):recovered=None
+                    # A successful retry is acknowledged only by Store's import
+                    # transaction; a cancelled/failed commit remains retryable.
+                    if recovered:
+                        before=json.loads(row['media_json']);after=recovered.get('media',[])
+                        ready=any(i.get('status')=='available' for i in after)
+                        detail=lambda items:[(i.get('status'),i.get('sha256'),i.get('reason_code')) for i in items]
+                        if ready or detail(before)!=detail(after):
+                            result.append(recovered)
+                            chats[row['conversation_id']]=dict(username=row['conversation_id'],name=row['conversation'])
+                        if not ready:retry_result(db,row['id'],False,reason=next((i.get('reason_code') for i in after if i.get('status')=='unavailable'),None),now=now)
+                    else:retry_result(db,row['id'],False,now=now)
+                db.commit()
                 if attempted>=4:break
             else:
                 if len(rows)<128:self.after=0
@@ -66,7 +93,7 @@ class WeChatMediaRetries:
     @staticmethod
     def recover(media,raw):
         text,items,reply=media.parse(raw)
-        if any(i.get('status') in ('available','omitted') for i in items):
+        if items:
             if text is not None:raw['text']=text
             raw.update(media=items,reply_to=reply)
             return raw
@@ -121,15 +148,16 @@ class QQMediaRetries(WeChatMediaRetries):
 
     @staticmethod
     def recover(media,raw):
+        from chatlocal.media import media_path
         items=[];changed=False
         for item in raw['media']:
             if not isinstance(item,dict):return None
             new=item
-            if item.get('status')=='unavailable' and item.get('kind') in ('image','sticker','gif'):
+            if item.get('status') in ('unavailable','available') and item.get('kind') in ('image','sticker','gif'):
                 metadata=item.get('metadata') or {}
                 md5=metadata.get('md5');filename=metadata.get('filename','')
                 if isinstance(md5,str) and re.fullmatch('[a-fA-F0-9]{32}',md5) and isinstance(filename,str):
                     new=media.resolve(item['kind'],md5,filename,raw.get('timestamp'))
-                    changed=changed or new['status'] in ('available','omitted')
+                    changed=changed or new['status'] in ('available','omitted') or new.get('reason_code')!=item.get('reason_code')
             items.append(new)
-        if changed:return dict(raw,media=items)
+        if changed or any(i.get('status')=='available' and media_path(i) is not None for i in items):return dict(raw,media=items)

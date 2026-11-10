@@ -4,18 +4,26 @@ This is a publication gate, not a claim that automated scanning finds all PII.
 Review documentation and publish only the intended branch and release tag.
 """
 import argparse
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import tarfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PRIVATE_ROOTS = {'.git', '.venv', '.tmp', 'data', 'imports', 'exports', 'reports', 'release', 'build'}
+PRIVATE_ROOTS = {'.git', '.venv', '.tmp', 'data', 'imports', 'exports', 'reports', 'release', 'build', 'instances'}
 SECRET = re.compile(r'(?:sk-[A-Za-z0-9]{24,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)')
 PERSONAL_PATH = re.compile(r'[A-Za-z]:[\\/]Users[\\/](?!Public(?:[\\/]|\b)|Default(?:[\\/]|\b))[^\\/\s<>]+', re.I)
 TEXT_EXT = {'.py', '.js', '.cjs', '.css', '.html', '.md', '.txt', '.json', '.toml', '.yml', '.yaml', '.cs', '.ps1', '.example', '.config'}
+
+
+@lru_cache(maxsize=1)
+def official_snowluma_archives():
+    manifest=json.loads((ROOT/'chatlocal/snowluma_manifest.json').read_text('utf-8'))
+    return {'resources/snowluma/'+s['name']:s['sha256'] for s in manifest.get('archives',{}).values()}
 
 
 def allowed_path(name, *, archive=False):
@@ -31,7 +39,7 @@ def allowed_path(name, *, archive=False):
         return False
     if archive:
         if 'snowluma' in p.parts or any(part.lower().startswith('snowluma-') for part in p.parts):
-            return False
+            if name not in official_snowluma_archives():return False
         if p.name.endswith('.QA.exe') or p.name == 'direct_url.json':
             return False
         if p.parts[0] == '.cache' and (len(p.parts) < 3 or p.parts[1] not in {'rapidocr', 'voice-models'}):
@@ -86,6 +94,8 @@ def source_check():
 
 
 def archive_check(path):
+    if path.name.endswith('.tar.gz'):
+        return linux_archive_check(path)
     errors = []
     with zipfile.ZipFile(path) as z:
         names = [info.filename for info in z.infolist() if not info.is_dir()]
@@ -114,6 +124,11 @@ def archive_check(path):
             rel = name.removeprefix('Tulpa/')
             if not allowed_path(rel, archive=True):
                 errors.append('private archive path: ' + rel)
+            if rel in official_snowluma_archives():
+                if hashlib.sha256(z.read(name)).hexdigest()!=official_snowluma_archives()[rel]:
+                    errors.append('unverified SnowLuma archive: '+rel)
+                if 'Tulpa/doc/licenses/SL_LICENSE.txt' not in expected:
+                    errors.append('missing SnowLuma license')
             if rel == 'runtime/Lib/site-packages/certifi/cacert.pem':
                 ca = z.read(name).decode('ascii')
                 if '-----BEGIN CERTIFICATE-----' not in ca or 'PRIVATE KEY' in ca:
@@ -132,6 +147,44 @@ def archive_check(path):
         sha = hashlib.file_digest(stream, 'sha256').hexdigest()
     return dict(archive=path.name, version=manifest['version'], commit=head, files=len(names),
                 bytes=path.stat().st_size, sha256=sha, archive_scan='passed', crc='passed')
+
+
+def linux_archive_check(path):
+    """Validate the actual Linux deliverable, including modes and every byte."""
+    errors = []
+    with tarfile.open(path, 'r:gz') as archive:
+        members = archive.getmembers()
+        names = [m.name for m in members]
+        if len(names) != len(set(names)) or any(not m.isfile() or not m.name.startswith('Tulpa/') for m in members):
+            raise RuntimeError('Unexpected Linux archive root, link or duplicate entry')
+        manifest = json.load(archive.extractfile('Tulpa/build-manifest.json'))
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+        expected = {'Tulpa/'+name for name in manifest['files']} | {'Tulpa/build-manifest.json'}
+        if set(names) != expected or set(manifest['file_sha256']) != set(manifest['files']):
+            errors.append('Linux archive does not match integrity manifest')
+        if (manifest.get('product'), manifest.get('platform'), manifest.get('edition'), manifest.get('checkpoint')) != ('Tulpa', 'linux', 'source', head):
+            errors.append('Unexpected Linux product, platform or source commit')
+        for name in ('tulpa', 'setup-linux.sh', 'LICENSE', 'README.md', 'requirements/linux.txt',
+                     'requirements/tui.txt', 'chatlocal/terminal_cli.py', 'chatlocal/tui/app.py'):
+            if 'Tulpa/'+name not in expected: errors.append('Missing Linux entry: '+name)
+        for member in members:
+            rel = member.name.removeprefix('Tulpa/')
+            raw = archive.extractfile(member).read()
+            if not allowed_path(rel, archive=True): errors.append('Private Linux path: '+rel)
+            if rel in official_snowluma_archives():
+                if hashlib.sha256(raw).hexdigest()!=official_snowluma_archives()[rel]:
+                    errors.append('Unverified SnowLuma archive: '+rel)
+                if 'Tulpa/doc/licenses/SL_LICENSE.txt' not in expected:
+                    errors.append('Missing SnowLuma license')
+            errors.extend(check_text(rel, raw))
+            if rel != 'build-manifest.json' and hashlib.sha256(raw).hexdigest() != manifest['file_sha256'].get(rel):
+                errors.append('Linux hash mismatch: '+rel)
+            if rel in ('tulpa', 'setup-linux.sh') and (not member.mode & 0o111 or b'\r\n' in raw):
+                errors.append('Linux launcher must be executable with LF line endings: '+rel)
+    if errors: raise RuntimeError('\n'.join(errors))
+    with path.open('rb') as stream: sha = hashlib.file_digest(stream, 'sha256').hexdigest()
+    return dict(archive=path.name, version=manifest['version'], commit=head, files=len(names),
+                bytes=path.stat().st_size, sha256=sha, archive_scan='passed')
 
 
 if __name__ == '__main__':

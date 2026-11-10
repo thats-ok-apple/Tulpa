@@ -16,7 +16,7 @@ contents = target / 'Contents'
 (contents / 'MacOS').mkdir(parents=True)
 (contents / 'Resources').mkdir()
 info = dict(CFBundleName='Tulpa', CFBundleDisplayName='Tulpa — Mac',
-    CFBundleIdentifier='local.tulpa.macos', CFBundleExecutable='Tulpa',
+    CFBundleIdentifier='local.tulpa.macos.preview', CFBundleExecutable='Tulpa',
     CFBundlePackageType='APPL', CFBundleVersion=VERSION,
     CFBundleShortVersionString=VERSION+'-mac-preview', LSMinimumSystemVersion='12.0',
     NSHighResolutionCapable=True, CFBundleIconFile='Tulpa.icns')

@@ -7,7 +7,7 @@ import tempfile
 import time
 
 sys.path.insert(0,str(Path(__file__).parent))
-from check_mcp_language_learning import Clock, ROOT
+from check_mcp_language_learning import Clock, ROOT, jargon_fixture, meaning_fixture
 from chatlocal.mcp_jargon_match import find_known_terms
 from chatlocal.mcp_language_store import LanguageStore, LearningError
 
@@ -29,7 +29,9 @@ def main():
             for i in range(10):
                 store.observe(binding,dict(peer=True,source_id=f'{serial}-{i}',text=f'{body} 样本{i}',at=clock()))
             t=store.claim(binding,'context-'+binding['gid']);assert t and t['stage']=='extract',t
-            result=dict(expressions=[],jargon=[dict(term=word,source_id=t['material']['messages'][0]['source_id']) for word in terms])
+            store.submit(binding,t['job_id'],t['lease'],f'expr-{serial}',dict(expressions=[]))
+            t=store.claim(binding,'context-'+binding['gid']);assert t['stage']=='extract_jargon'
+            result=jargon_fixture(t,terms)
             response=store.submit(binding,t['job_id'],t['lease'],f'call-{serial}',result)
             return t,result,response
         def word(scope=None):
@@ -55,6 +57,7 @@ def main():
             if stage=='with_context':
                 assert len(t['material']['evidence'])<=3
                 assert all('云朵开机' in item['messages'][0]['text'] for item in t['material']['evidence'])
+                result=meaning_fixture(t)
             if stage=='without_context':assert set(t['material'])=={'term'}
             store.submit(b,t['job_id'],t['lease'],'meaning-'+stage,result)
         assert word()['is_jargon'] and word()['last_inference_count']==4
@@ -109,7 +112,9 @@ def main():
         clock.advance(31)
         for i in range(10):limited_store.observe(b,dict(peer=True,source_id=f'no-match-{i}',text='云朵开机',at=clock()))
         task=limited_store.claim(b,'no-cache-context')
-        out=limited_store.submit(b,task['job_id'],task['lease'],'no-cache-call',dict(expressions=[],jargon=[]))
+        limited_store.submit(b,task['job_id'],task['lease'],'no-cache-expr',dict(expressions=[]))
+        task=limited_store.claim(b,'no-cache-context')
+        out=limited_store.submit(b,task['job_id'],task['lease'],'no-cache-call',dict(jargon=[]))
         assert out['jargon_observation']['new_batch_hits']==out['jargon_observation']['cached_terms_checked']==0
         messages=[dict(source_id=str(i),text=' '.join(f'term{j:03}' for j in range(50))) for i in range(20)]
         began=time.perf_counter()

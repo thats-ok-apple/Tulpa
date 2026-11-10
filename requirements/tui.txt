@@ -1,0 +1,3 @@
+# Optional terminal interface, implemented by Claude Code.
+textual==8.2.8
+textual-image==0.14.1

@@ -17,7 +17,7 @@ from .config import ROOT, DATA, DB
 from .sync import message_commit_lock
 
 PLATFORMS=('qq','wechat')
-DEFAULT=dict(qq='database',wechat='database',load_stickers=False,wechat_read_images=True)
+DEFAULT=dict(qq='database',wechat='database',load_stickers=False,wechat_read_images=True,photo_on_demand=False)
 LIVE_SCOPE_KEY=json.dumps(dict(enabled=True,conversations=None),sort_keys=True)
 DETAILS={
     'source_busy':'客户端正在写入，正在重试；未推进进度。',
@@ -70,6 +70,9 @@ def process_names():
             if command.strip().endswith('.app/Contents/MacOS/QQ'):names.add('qq.exe')
             if command.strip().endswith(('.app/Contents/MacOS/WeChat','.app/Contents/MacOS/Weixin')):names.add('wechat.exe')
         return names
+    if os.name != 'nt':
+        from .platform_process import linux_processes
+        return {Path(item['executable']).name.lower() for item in linux_processes()}
     import ctypes
     from ctypes import wintypes as w
     class Entry(ctypes.Structure):
@@ -117,7 +120,7 @@ class Worker:
         self.last_stage='runtime'
         self.process=subprocess.Popen([sys.executable,str(ROOT/'scripts/live_reader.py'),platform],cwd=ROOT,
             env=dict(os.environ,PYTHONUTF8='1'),stdin=subprocess.PIPE,stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,text=True,encoding='utf-8',creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            stderr=subprocess.DEVNULL,text=True,encoding='utf-8',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         self.output=queue.Queue(maxsize=2)
         def receive():
             try:
@@ -166,7 +169,7 @@ class LiveManager:
 
     def configure(self, body):
         value={k:body.get(k,self.settings[k]) for k in DEFAULT}
-        if any(value[p] not in ('off','database') for p in PLATFORMS) or any(type(value[k]) is not bool for k in ('load_stickers','wechat_read_images')):
+        if any(value[p] not in ('off','database') for p in PLATFORMS) or any(type(value[k]) is not bool for k in ('load_stickers','wechat_read_images','photo_on_demand')):
             raise ValueError('实时模式或表情设置无效')
         with self.guard:
             with self.store.connect() as db:
@@ -180,9 +183,16 @@ class LiveManager:
     def snapshot(self):
         with self.guard:states=[dict(self.states[p],mode=self.settings[p]) for p in PLATFORMS]
         with self.store.connect() as db:
-            persisted={r['platform']:dict(r) for r in db.execute('SELECT platform,last_received,last_commit,last_id,total_added FROM live_state')}
-        for state in states:state.update(persisted[state['platform']])
-        return dict(platforms=states,settings=dict(self.settings),server_time=time.time())
+            persisted={r['platform']:dict(r) for r in db.execute('SELECT platform,last_received,last_commit,last_success_at,last_id,total_added,checkpoint FROM live_state')}
+        from .live_recovery import public
+        for state in states:
+            record=persisted[state['platform']]
+            state.update(public(json.loads(record.pop('checkpoint'))))
+            state.update(record)
+            state['last_message_age_seconds']=round(max(0,time.time()-state['last_received'])) if state['last_received'] else None
+            state['data_lag_seconds']=state['last_message_age_seconds'] if state['status']=='degraded' else None
+        from .image_index import status as image_status
+        return dict(platforms=states,settings=dict(self.settings),server_time=time.time(),images=image_status(self.store),connection=dict(primary='local_direct',bridge_independent=True,note='插件桥接的429属于连接错误，不代表微信监听失败'))
 
     def start(self):
         # Isolated stores used by offline checks must never start real readers.
@@ -201,7 +211,7 @@ class LiveManager:
         with self.guard:
             if time.monotonic()-self.process_checked>3:
                 self.names=process_names();self.process_checked=time.monotonic()
-            return bool(self.names & ({'qq.exe'} if p=='qq' else {'weixin.exe','wechat.exe'}))
+            return bool(self.names & ({'qq.exe','qq'} if p=='qq' else {'weixin.exe','wechat.exe','wechat','weixin'}))
 
     def worker(self, p):
         with self.guard:
@@ -247,7 +257,7 @@ class LiveManager:
                 read_started=time.time()
                 result=self.worker(p).read(dict(checkpoint=checkpoint,conversations=None,
                     since=since,load_stickers=settings['load_stickers'],
-                    wechat_read_images=settings['wechat_read_images']))
+                    wechat_read_images=settings['wechat_read_images'],photo_on_demand=settings['photo_on_demand']))
                 if not result['ok']:raise ValueError(result['error'])
                 # Only a live settings/disable change cancels this batch.
                 # One-off historical imports have an independent scope.
@@ -269,12 +279,30 @@ class LiveManager:
                             commit(db,transition,0,0)
                         added=0
                 metrics=dict(result['metrics'],added=added,elapsed_seconds=round(time.time()-read_started,4))
-                self.update(p,status='listening',detail='等待部分消息取得服务器 ID；其余会话继续读取' if payload.get('pending_ack') else '数据库监听中；只读取新增消息',metrics=metrics,failures=0)
+                from .live_recovery import public
+                diagnostic=public(result['checkpoint'])
+                self.update(p,status='degraded' if diagnostic['affected_conversations'] else 'listening',
+                    detail='部分会话正在恢复或因身份冲突暂停；其他会话继续读取。' if diagnostic['affected_conversations'] else '等待部分消息取得服务器 ID；其余会话继续读取' if payload.get('pending_ack') else '数据库监听中；只读取新增消息',
+                    metrics=metrics,failures=0,error_type=None,next_retry_at=None)
                 self.log(p,'batch',metrics)
                 last=None if payload.get('more') else wake
                 last_scan=time.monotonic();failures=0;busy_count=0;next_try=time.time()+2 if payload.get('pending_ack') else 0
             except Exception as exc:
                 if self.stop_event.is_set():break
+                from .live_recovery import IdentityConflict,quarantine
+                if isinstance(exc,IdentityConflict):
+                    with self.store.connect() as db:
+                        existing=json.loads(db.execute('SELECT checkpoint FROM live_state WHERE platform=?',(p,)).fetchone()[0])
+                        # Only add quarantine metadata; never advance a failed batch.
+                        following=quarantine(existing,exc.conversation_id)
+                        if following==existing and 'result' in locals():
+                            following=quarantine(dict(existing,cursors={**existing.get('cursors',{}),**{k:dict(last=0,signature='') for k in result.get('checkpoint',{}).get('cursors',{}) if k not in existing.get('cursors',{})}}),exc.conversation_id)
+                        from .live_state import commit
+                        commit(db,dict(platform=p,previous=existing,next=following,observed_at=time.time(),successful=False),0,0)
+                    self.reset_worker(p)
+                    self.update(p,status='degraded',detail='一个会话身份冲突已隔离，其他会话继续读取。',error_type='native_identity_conflict')
+                    last=None;next_try=time.time()+2
+                    continue
                 code=str(exc) if isinstance(exc,(ValueError,TimeoutError)) else 'reader_failed'
                 busy=code=='source_busy' or '正在读取或导入数据' in code
                 if busy:
@@ -286,10 +314,11 @@ class LiveManager:
                     stage=getattr(self.workers.get(p),'last_stage','runtime')
                     detail=DETAILS.get(code,DETAILS['reader_failed'])
                     if code=='worker_timeout':detail+=' 停在：'+STAGES.get(stage,'读取数据')+'；进度未推进。'
-                    self.update(p,status='degraded',detail=detail,failures=failures)
+                    delay=min(300,2**min(failures,8))
+                    self.update(p,status='degraded',detail=detail,failures=failures,error_type=code,next_retry_at=time.time()+delay)
                     self.log(p,'failure',dict(code=code if code in DETAILS else 'reader_failed',stage=stage))
                     self.reset_worker(p)
-                    next_try=time.time()+min(60,2**min(failures,5))
+                    next_try=time.time()+delay
 
     def log(self, platform,event,metrics):
         # Aggregate diagnostics only. No message text, paths, IDs, or keys.
@@ -305,6 +334,7 @@ class LiveManager:
 def install_live_routes(app,store,same_origin):
     from fastapi import Request,HTTPException
     manager=LiveManager(store)
+    app.state.tulpa_live=manager
     @app.get('/api/live-status')
     def live_status(request:Request):same_origin(request);return manager.snapshot()
     @app.put('/api/live-settings')
@@ -312,6 +342,19 @@ def install_live_routes(app,store,same_origin):
         same_origin(request)
         try:return manager.configure(body)
         except ValueError as exc:raise HTTPException(400,str(exc)) from None
+    @app.post('/api/live-recovery/retry')
+    def retry_recovery(request:Request,body:dict):
+        same_origin(request)
+        if set(body)!={'platform','issue_id'} or body.get('platform') not in PLATFORMS or not isinstance(body.get('issue_id'),str):raise HTTPException(400)
+        p=body['platform']
+        with store.connect() as db:
+            cp=json.loads(db.execute('SELECT checkpoint FROM live_state WHERE platform=?',(p,)).fetchone()[0])
+            key=next((k for k in cp.get('recovery',{}) if hashlib.sha256(k.encode()).hexdigest()[:16]==body['issue_id']),None)
+            if key is None:raise HTTPException(404,'恢复项不存在')
+            cp['recovery'][key].update(status='retry',attempts=0,updated_at=time.time(),next_retry_at=time.time())
+            db.execute('UPDATE live_state SET checkpoint=? WHERE platform=?',(json.dumps(cp),p))
+        with manager.guard:manager.revision+=1
+        return dict(scheduled=True)
     @app.post('/api/live-visible')
     def visible(request:Request,body:dict):
         same_origin(request)

@@ -33,11 +33,12 @@ def query(store, plan, sql, max_rows=40, *, cancel=None, deadline=None):
     try:
         from .config import ROOT
         from .voice_process import ChildJob
+        from .platform_process import owned_popen
         payload=json.dumps(dict(path=str(store.path),plan=vars(plan),sql=sql,max_rows=max_rows),ensure_ascii=False)
-        proc=subprocess.Popen([sys.executable,'-m','chatlocal.investigation_sql'],cwd=ROOT,
+        proc=owned_popen([sys.executable,'-m','chatlocal.investigation_sql'],cwd=ROOT,memory_bytes=384*1024**2,
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-            encoding='utf-8',env=dict(os.environ,PYTHONUTF8='1'),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-        if os.name=='nt':job=ChildJob(proc,memory_bytes=384*1024**2)
+            encoding='utf-8',env=dict(os.environ,PYTHONUTF8='1'))
+        job=ChildJob(proc,memory_bytes=384*1024**2)
         first=True
         while True:
             if (cancel is not None and cancel.is_set()) or (deadline and time.monotonic()>=deadline):
@@ -52,8 +53,8 @@ def query(store, plan, sql, max_rows=40, *, cancel=None, deadline=None):
     except (OSError,ValueError):
         return dict(error='隔离SQL进程无法启动或响应无效；原数据库未修改。',error_code='worker_failed')
     finally:
-        if proc and proc.poll() is None:proc.kill();proc.communicate()
         if job:job.close()
+        if proc and proc.poll() is None:proc.kill();proc.communicate()
         _slots.release()
 
 
@@ -66,6 +67,8 @@ def execute_projection(payload):
     plan=Plan(**payload['plan']);where,args=scope_sql(plan)
     started=time.monotonic();db=sqlite3.connect(':memory:');src=None
     try:
+        if sys.platform == 'darwin':
+            db.execute('PRAGMA hard_heap_limit=268435456')
         db.execute('PRAGMA temp_store=MEMORY')
         src=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=.5)
         src.execute('PRAGMA query_only=ON');src.execute('BEGIN')

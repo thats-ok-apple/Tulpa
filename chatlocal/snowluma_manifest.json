@@ -1,15 +1,159 @@
 {
   "schema": 1,
-  "version": "1.14.22",
-  "source_commit": "87527cb7641a5a42f8f0efb73cb066102e004dee",
-  "adapter": "snowluma-local-1.14.22",
-  "mode": "user_selected_local_directory",
-  "release_url": "https://github.com/SnowLuma/SnowLuma/releases/tag/v1.14.22",
-  "required_files": ["index.mjs", "node.exe", "package.json", "EULA.md", "PRIVACY.md", "native/snowluma-win32-x64.dll", "native/snowluma-win32-x64.node", "native/websocket-win32-x64.node", "native/ffmpeg/ffmpegAddon.win32.x64.node"],
-  "agreements": [
-    {"id":"eula","title":"SnowLuma 使用细则","version":"1.1","file":"EULA.md","url":"https://github.com/SnowLuma/SnowLuma/blob/v1.14.22/EULA.md","sha256":"373c4f7c5d87da116fa4444ce45b3f41a0cf238ec4ee3f993a2123bfc945a5b6"},
-    {"id":"privacy","title":"SnowLuma 隐私政策","file":"PRIVACY.md","url":"https://github.com/SnowLuma/SnowLuma/blob/v1.14.22/PRIVACY.md","sha256":"d36474445ce510e27e64fbe76609cc088c75b1dfa3dfb6c257241598749f08fd"}
+  "version": "2.1.1",
+  "source_commit": "f8cb15c27bca3d2d1bd044a921e55bfc44bb5e60",
+  "adapter": "snowluma-native-2.1.1",
+  "mode": "official_managed",
+  "docker": {
+    "repository": "motricseven7/snowluma",
+    "tag": "v1.14.22",
+    "platforms": {
+      "amd64": "sha256:ef2e593837a1d7241a611338f57e787ff6a1340f29d01ff2423590be9a83c83c",
+      "arm64": "sha256:d601094896a1a80392e0d6a6ec6611b62414c851685d6c82eb88dfefeaf8446c"
+    },
+    "version": "1.14.22"
+  },
+  "release_url": "https://github.com/SnowLuma/SnowLuma/releases/tag/v2.1.1",
+  "required_files": [
+    "index.mjs",
+    "node.exe",
+    "package.json",
+    "EULA.md",
+    "PRIVACY.md",
+    "native/snowluma-win32-x64.dll",
+    "native/snowluma-win32-x64.node",
+    "native/websocket-win32-x64.node",
+    "native/ffmpeg/ffmpegAddon.win32.x64.node"
   ],
-  "scope": ["configure_user_selected_directory_in_place", "backup_existing_config_before_write", "loopback_admin_http_ws", "manage_random_credentials", "bind_one_selected_qq_process", "resume_same_verified_account"],
-  "compatibility": {"managed":["1.14.22"],"existing_import":["1.14.19","1.14.20","1.14.21","1.14.22"],"real_pc_verified":false}
+  "agreements": [
+    {
+      "id": "eula",
+      "title": "SnowLuma 使用细则",
+      "version": "1.1",
+      "file": "EULA.md",
+      "url": "https://github.com/SnowLuma/SnowLuma/blob/v2.1.1/EULA.md",
+      "sha256": "373c4f7c5d87da116fa4444ce45b3f41a0cf238ec4ee3f993a2123bfc945a5b6"
+    },
+    {
+      "id": "privacy",
+      "title": "SnowLuma 隐私政策",
+      "file": "PRIVACY.md",
+      "url": "https://github.com/SnowLuma/SnowLuma/blob/v2.1.1/PRIVACY.md",
+      "sha256": "d36474445ce510e27e64fbe76609cc088c75b1dfa3dfb6c257241598749f08fd"
+    }
+  ],
+  "scope": [
+    "download_verified_official_runtime",
+    "deploy_in_private_tulpa_directory",
+    "use_verified_bundled_archive",
+    "configure_user_selected_directory_in_place",
+    "backup_existing_config_before_write",
+    "loopback_admin_http_ws",
+    "manage_random_credentials",
+    "bind_one_selected_qq_process",
+    "resume_same_verified_account"
+  ],
+  "compatibility": {
+    "managed": [
+      "2.1.1"
+    ],
+    "existing_import": [
+      "1.14.19",
+      "1.14.20",
+      "1.14.21",
+      "1.14.22",
+      "2.0.3",
+      "2.1.0",
+      "2.1.1"
+    ],
+    "real_pc_verified": false,
+    "real_pc_samples": [
+      {
+        "platform": "win-x64",
+        "version": "2.0.3",
+        "date": "2026-10-21",
+        "checks": [
+          "official_cold_download",
+          "official_initialization_and_consent",
+          "single_online_qq",
+          "http_ws_identity",
+          "tulpa_restart",
+          "credential_reuse",
+          "loopback_only"
+        ]
+      },
+      {
+        "platform": "win-x64",
+        "version": "2.1.1",
+        "date": "2026-10-22",
+        "checks": [
+          "official_cold_download",
+          "official_initialization_and_consent",
+          "single_online_qq",
+          "http_ws_identity",
+          "tulpa_restart",
+          "credential_reuse",
+          "protected_files_unchanged"
+        ]
+      },
+      {
+        "platform": "linux-x64",
+        "version": "2.1.1",
+        "date": "2026-10-22",
+        "checks": [
+          "verified_official_bundle",
+          "native_runtime_initialization",
+          "management_authentication",
+          "official_consent",
+          "waiting_qq",
+          "cancel_owned_service"
+        ],
+        "qq_verified": false
+      }
+    ]
+  },
+  "linux_required_files": {
+    "x64": [
+      "index.mjs",
+      "node",
+      "package.json",
+      "EULA.md",
+      "PRIVACY.md",
+      "native/snowluma-linux-x64.so",
+      "native/snowluma-linux-x64.node",
+      "native/websocket-linux-x64.node",
+      "native/ffmpeg/ffmpegAddon.linux.x64.node"
+    ],
+    "arm64": [
+      "index.mjs",
+      "node",
+      "package.json",
+      "EULA.md",
+      "PRIVACY.md",
+      "native/snowluma-linux-arm64.so",
+      "native/snowluma-linux-arm64.node",
+      "native/websocket-linux-arm64.node",
+      "native/ffmpeg/ffmpegAddon.linux.arm64.node"
+    ]
+  },
+  "archives": {
+    "linux-arm64": {
+      "name": "SnowLuma-v2.1.1-linux-arm64.tar.gz",
+      "url": "https://github.com/SnowLuma/SnowLuma/releases/download/v2.1.1/SnowLuma-v2.1.1-linux-arm64.tar.gz",
+      "size": 51816108,
+      "sha256": "0eb63386bc0d6780df28c3fd8f7473a48ac80cd31ab825f17ddec55ab7dade3a"
+    },
+    "linux-x64": {
+      "name": "SnowLuma-v2.1.1-linux-x64.tar.gz",
+      "url": "https://github.com/SnowLuma/SnowLuma/releases/download/v2.1.1/SnowLuma-v2.1.1-linux-x64.tar.gz",
+      "size": 52255600,
+      "sha256": "9360bf8047e640b5d9b7884500734add700d313caa60059df7732a736bb9d9a0"
+    },
+    "win-x64": {
+      "name": "SnowLuma-v2.1.1-win-x64.zip",
+      "url": "https://github.com/SnowLuma/SnowLuma/releases/download/v2.1.1/SnowLuma-v2.1.1-win-x64.zip",
+      "size": 42694125,
+      "sha256": "c739171f95c27706767e69ba36099707c222fcec639b46f4d59689997b527772"
+    }
+  }
 }

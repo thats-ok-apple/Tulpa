@@ -17,6 +17,7 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from check_mcp_chat_targets import TargetBot, text_segment
 from check_mcp_chat import Events, eventually, ROOT
 import httpx
@@ -101,7 +102,7 @@ def main():
         assert address[0] in ('127.0.0.1','localhost','::1') and int(address[1]) in allowed_ports,('non-fixture connection blocked',address)
         connections.append(address);return real_connect(address,*args,**kwargs)
     try:
-        with tempfile.TemporaryDirectory(prefix='tulpa-reactions-') as tmp,patch.dict('os.environ',{},clear=True),patch('socket.create_connection',restricted_connect):
+        with tempfile.TemporaryDirectory(prefix='tulpa-reactions-') as tmp,patch.dict('os.environ',isolated_env(),clear=True),patch('socket.create_connection',restricted_connect):
             root=Path(tmp);store=Store(root/'chats.sqlite3')
             (root/'.env').write_text(f'REPLY_ONEBOT_URL=http://127.0.0.1:{upstream.server_port}\nREPLY_ONEBOT_WS_URL=ws://127.0.0.1:{events.port}\nREPLY_ONEBOT_WS_TOKEN=event-fixture\n','utf-8')
             with patch('chatlocal.onebot.ROOT',root),patch('chatlocal.message_sender.ROOT',root):

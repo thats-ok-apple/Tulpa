@@ -90,7 +90,7 @@ def config():
     language=val('VOICE_LANGUAGE','zh')
     if language not in ('zh','auto','en'):raise ValueError('VOICE_LANGUAGE 必须为 zh、auto 或 en')
     return dict(language=language,model=local_path(val('VOICE_MODEL_PATH','.cache/voice-models/ggml-small-q5_1.bin')),
-        executable=local_path(val('VOICE_EXECUTABLE','tools/whispercpp/Release/whisper-cli.exe')),
+        executable=local_path(val('VOICE_EXECUTABLE','tools/whispercpp/Release/whisper-cli.exe' if os.name=='nt' else 'tools/whispercpp/bin/whisper-cli')),
         threads=number('VOICE_THREADS',4,1,8),timeout=number('VOICE_TIMEOUT_SECONDS',180,15,600),
         max_seconds=number('VOICE_MAX_SECONDS',180,1,600),max_bytes=number('VOICE_MAX_BYTES',16*1024*1024,1024,64*1024*1024))
 
@@ -111,8 +111,9 @@ class VoiceService:
         if self.thread:self.thread.join(timeout=3)
     def _child(self,args,timeout):
         from .voice_process import ChildJob
-        process=subprocess.Popen(args,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        from .platform_process import owned_popen
+        process=owned_popen(args,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+            memory_bytes=2*1024**3)
         job=None
         deadline=time.monotonic()+timeout
         try:
@@ -125,8 +126,9 @@ class VoiceService:
                     return process.returncode
                 except subprocess.TimeoutExpired:pass
         finally:
-            if process.poll() is None:process.kill();process.communicate()
             if job:job.close()
+            if process.poll() is None:process.kill()
+            process.communicate()
     def enqueue(self,mid,action='transcribe',retry=False):
         if action not in ('transcribe','prepare'):raise ValueError('未知语音操作')
         with self.store.connect() as db:
@@ -151,20 +153,16 @@ class VoiceService:
         return dict(message_id=mid,status='queued',note='本地转写仍在排队或执行，稍后可再次调用同一工具。')
     def _loop(self):
         # Cross-process ownership also protects CLI/Agent calls from double ASR.
-        if os.name == 'nt':
-            import msvcrt
-        else:
-            import fcntl
+        from .platform_lock import file_lock
         path=self.root/'worker.lock'
-        path.touch(exist_ok=True);lock=path.open('r+b')
+        lock=file_lock(path)
+        acquired=False
         try:
             while True:
-                try:
-                    if os.name == 'nt':msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
-                    else:fcntl.flock(lock.fileno(),fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
+                try:lock.__enter__();acquired=True;break
                 except OSError:
                     if self.stop.wait(2):return
+                    lock=file_lock(path)
             with self.store.connect() as db:
                 db.execute("UPDATE voice_jobs SET state='queued' WHERE state='running'")
                 db.execute("UPDATE voice_sources SET status='queued' WHERE message_id IN (SELECT message_id FROM voice_jobs WHERE state='queued')")
@@ -192,7 +190,8 @@ class VoiceService:
                             with self.store.connect() as db:db.execute('DELETE FROM voice_jobs WHERE message_id=?',(job['message_id'],))
                             cleanup(self.store)
                 else:self.wake.wait(2);self.wake.clear()
-        finally:lock.close()
+        finally:
+            if acquired:lock.__exit__(None,None,None)
     def _run(self,mid,action):
         with self.store.connect() as db:
             row=db.execute('SELECT v.*,m.platform,m.conversation_id,m.source_id FROM voice_sources v JOIN messages m ON m.id=v.message_id WHERE message_id=?',(mid,)).fetchone()

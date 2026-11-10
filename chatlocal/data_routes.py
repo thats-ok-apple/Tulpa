@@ -23,7 +23,7 @@ def run_reader(platform,arguments,output,*,store=None,progress=None,cancelled=No
     result=subprocess.run([sys.executable,str(ROOT/'scripts'/f'export_{platform}.py'),
         '--refresh','--output',str(output),*arguments],cwd=ROOT,
         env=dict(os.environ,PYTHONUTF8='1'),capture_output=True,text=True,encoding='utf-8',errors='replace',
-        timeout=600,creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        timeout=600,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     if result.returncode:
         log=ROOT/'reports/private'/f'data-{platform}-error.log'
         log.parent.mkdir(parents=True,exist_ok=True)

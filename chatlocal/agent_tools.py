@@ -73,7 +73,8 @@ SCHEMAS = [
          '请结合整段理解谁在谈什么；窗口截断或指代/起因不明时get_context扩大阅读，不能仅凭命中句断言。',
          dict(FILTERS, query=dict(type='string',description='正文关键词；指定sender_id或has_media=true时可为空'),
               sender_id=dict(type='string',description='精确发送者账号，须同时指定platform；昵称用find_people解析'),
-              author={'type':'string','enum':['any','self','others']}), ['query']),
+              author={'type':'string','enum':['any','self','others']},
+              search_source=dict(type='string',enum=['any','text','image_ocr'],default='any',description='默认同时搜索正文和已完成的本地图中文字索引；可仅查text或image_ocr')), ['query']),
     tool('get_context', '读取一条已知消息及同会话前后各若干条消息，含图片信息。仍受用户时间/平台/会话范围限制。',
          {'message_id': NUMBER, 'radius': dict(type='integer',minimum=0,maximum=8,default=3, description='0–8，默认 3')}, ['message_id']),
     tool('get_media','获取消息的本地图片/表情信息与可用状态，不读取图片内容；需要理解内容请调用 inspect_image。',
@@ -134,6 +135,7 @@ class ChatTools(ArtifactTools,InvestigationTools,WorkspaceTools,QQTools):
         self.lock = threading.RLock()
         self.workspace_context=None
         self.read_only=False
+        self.allow_image_text=True
         self.strict_scope_dates=False
         self.schemas=SCHEMAS
         where, args = scope_sql(plan)
@@ -207,6 +209,9 @@ class ChatTools(ArtifactTools,InvestigationTools,WorkspaceTools,QQTools):
             entry.update(time=display_time(row['timestamp'])+' +08:00',content=row['content'][:content_limit],
                          truncated=len(row['content'])>content_limit)
             entry['media']=[{k:v for k,v in item.items() if k!='url'} for item in public_media(mid,row.get('media',[]))]
+            if self.allow_image_text and row.get('image_text'):
+                entry['image_text']=row['image_text']
+                entry['match_source']=row.get('match_source','image_ocr')
             from .voice import evidence as voice_evidence
             voice=voice_evidence(self.store,mid)
             if voice:
@@ -447,8 +452,15 @@ class ChatTools(ArtifactTools,InvestigationTools,WorkspaceTools,QQTools):
         if args.get('sender_id'):
             where+=' AND m.sender_id=?';values.append(args['sender_id'])
         if expression:
-            where+=' AND (m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?) OR '+ ' OR '.join('instr(lower(m.content),?)>0' for _ in terms)+')'
-            values += [expression]+terms
+            text_clause='(m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?) OR '+ ' OR '.join('instr(lower(m.content),?)>0' for _ in terms)+')'
+            from .image_index import matching_clause
+            image_clause,image_values=matching_clause(expression,terms)
+            source=args.get('search_source','any')
+            if source=='image_ocr' and not self.allow_image_text:raise ValueError('图片权限未开启')
+            clauses=[]
+            if source!='image_ocr':clauses.append(text_clause);values += [expression]+terms
+            if source!='text' and self.allow_image_text:clauses.append(image_clause);values += image_values
+            where+=' AND ('+' OR '.join(clauses)+')'
         if args.get('author')=='self': where+=' AND m.is_self=1'
         elif args.get('author')=='others': where+=' AND (m.is_self=0 OR m.is_self IS NULL)'
         with self.store.connect() as db:
@@ -458,6 +470,12 @@ class ChatTools(ArtifactTools,InvestigationTools,WorkspaceTools,QQTools):
                 FROM messages m WHERE {where})
                 SELECT * FROM candidates ORDER BY slot,platform,timestamp DESC,id DESC LIMIT ? OFFSET ?''',
                 values+[args.get('limit',12),args.get('offset',0)]).fetchall()
+        if expression and self.allow_image_text and args.get('search_source','any')!='text':
+            from .image_index import evidence
+            with self.store.connect() as db:
+                rows=[dict(r,image_text=evidence(db,r['id'],terms)) for r in rows]
+                for row in rows:
+                    if row['image_text']:row['match_source']='text_and_image_ocr' if any(t in row['content'].lower() for t in terms) else 'image_ocr'
         result=self._page(rows,total,args.get('offset',0))
         return self._search_context(result,args)
 

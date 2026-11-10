@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+TULPA_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$TULPA_ROOT"
+if [ ! -x "$TULPA_ROOT/.venv/bin/python" ]; then
+    printf '%s\n' '首次启动：正在准备 Tulpa 运行环境……' >&2
+    sh "$TULPA_ROOT/setup-linux.sh" >&2
+fi
+exec "$TULPA_ROOT/.venv/bin/python" -m chatlocal.terminal_cli "$@"

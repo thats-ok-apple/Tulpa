@@ -28,6 +28,7 @@ def main():
     # Source links must work before anyone opens the MCP settings dialog.
     application.state.tulpa_mcp.source_base=f'http://127.0.0.1:{port}'
     server=uvicorn.Server(uvicorn.Config(application,host='127.0.0.1',port=port,access_log=False,log_level='warning',timeout_graceful_shutdown=5))
+    application.state.cli_shutdown=lambda: setattr(server,'should_exit',True)
     @application.post('/api/desktop/quit')
     def quit(request:Request):
         if not secrets.compare_digest(request.headers.get('authorization',''),'Bearer '+token):raise HTTPException(403)
@@ -38,9 +39,15 @@ def main():
             if server.should_exit:return
             time.sleep(.1)
         ready.write_text(json.dumps(dict(url=f'http://127.0.0.1:{port}',pid=os.getpid())),encoding='utf-8')
+        if hasattr(application.state,'tulpa_mcp'):
+            from chatlocal.cli_runtime import publish
+            publish(f'http://127.0.0.1:{port}')
     threading.Thread(target=notify,daemon=True).start()
     try:server.run(sockets=[listener])
     finally:ready.unlink(missing_ok=True);listener.close()
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    from chatlocal.platform_lock import file_lock
+    with file_lock(ROOT/'.tmp/mcp-application.lock'):
+        main()

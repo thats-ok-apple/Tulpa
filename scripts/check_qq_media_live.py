@@ -40,7 +40,10 @@ def main():
             retries=QQMediaRetries(store.path)
             assert retries.collect(parser,'test',None,now=now)[0]==[]
             target.write_bytes(b'incomplete')
-            assert retries.collect(parser,'test',None,now=now+16)[0]==[]
+            diagnostic,_=retries.collect(parser,'test',None,now=now+16)
+            assert len(diagnostic)==1 and diagnostic[0]['media'][1]['reason_code']=='cache_corrupt'
+            transition['previous']=cp;write(diagnostic)
+            assert store.import_file(source,live=transition,load_stickers=False)['duplicate']==1
             target.write_bytes(png)
             parser.index['a'*32]=[target.with_name('removed.jpg')]
             with patch.object(Path,'rglob',side_effect=AssertionError('No full rescan')):
@@ -58,7 +61,9 @@ def main():
             assert QQMediaRetries(store.path).collect(parser,'wrong',None,now=now+60)[0]==[]
             assert QQMediaRetries(store.path).collect(parser,'test',['test:group:other'],now=now+60)[0]==[]
             assert QQMediaRetries(store.path).collect(parser,'test',[],now=now+60)[0]==[]
-            assert QQMediaRetries(store.path).collect(parser,'test',None,now=now+90000)[0]==[]
+            late,_=QQMediaRetries(store.path).collect(parser,'test',None,now=now+90000)
+            assert len(late)==1 and late[0]['media'][1]['status']=='available', 'Durable jobs outlive the old 24-hour window'
+            assert QQMediaRetries(store.path).collect(parser,'test',None,now=now+8*86400)[0]==[]
             body=dict(platform='qq',conversations=['test:group:10'],start=today,end=today,load_stickers=False)
             assert prepare(store,dict(body,conversations=['other']))==[]
             assert prepare(store,dict(body,start='2000-01-01',end='2000-01-02'))==[]

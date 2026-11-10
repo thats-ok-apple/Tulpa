@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from chatlocal.snowluma_managed import ManagedSnowLuma,consent_key,load_manifest,_registry
 from chatlocal.snowluma_secure import ManagedError,SecretVault,atomic_json,sha256,file_lock
-from chatlocal.snowluma_local import LocalInstallation
+from chatlocal.snowluma_local import LocalInstallation,runtime_files,runtime_node
 from chatlocal.snowluma_runtime import SnowLumaAPI,onebot_config,process_identity
 from chatlocal.desktop_routes import install_desktop_routes
 
@@ -53,14 +53,17 @@ class Vault:
     def write(self,value):self.values[self.path]=dict(value)
 
 
+QQ_EXE='C:/Fixture/QQ.exe' if os.name=='nt' else '/opt/QQ/qq'
+
+
 class Runtime:
     def __init__(self):
-        self.qq={101:dict(pid=101,created=100,executable='C:/Fixture/QQ.exe')}
+        self.qq={101:dict(pid=101,created=100,executable=QQ_EXE)}
         self.owner=None;self.spawns=0;self.stops=0;self.external_hooks=set()
     def hooks(self):return set(self.external_hooks)
     def identity(self,pid):return copy.deepcopy(self.qq.get(pid))
     def spawn(self,directory,port,credentials,instance):
-        self.spawns+=1;self.owner=dict(pid=901,created=self.spawns,executable=str(directory/'node.exe'),instance=instance)
+        self.spawns+=1;self.owner=dict(pid=901,created=self.spawns,executable=str(runtime_node(directory)),instance=instance)
         return dict(self.owner)
     def owned(self,owner,directory,instance):return self.owner==owner and owner.get('instance')==instance
     def stop(self,owner,directory,instance):
@@ -71,12 +74,17 @@ def fixture_folder(folder, manifest):
     folder.mkdir(parents=True,exist_ok=True)
     files={'package.json':json.dumps(dict(name='@snowluma/runtime',version=manifest['version'])),
            'index.mjs':'// nonexecutable fixture','node.exe':b'MZ-fixture'}
-    for name in manifest['required_files']:
+    if os.name!='nt':
+        import platform
+        machine=183 if platform.machine() in ('aarch64','arm64') else 62
+        files.pop('node.exe');files['node']=b'\x7fELF\x02\x01'+bytes(12)+machine.to_bytes(2,'little')
+    for name in runtime_files(manifest):
         if name.startswith('native/'):files[name]=b'nonexecutable-native-fixture'
     for doc in manifest['agreements']:files[doc['file']]=doc['id']
     for name,value in files.items():
         (folder/name).parent.mkdir(parents=True,exist_ok=True)
         (folder/name).write_bytes(value.encode() if isinstance(value,str) else value)
+    if os.name!='nt':(folder/'node').chmod(0o700)
     return folder
 
 
@@ -159,7 +167,7 @@ def local_folder_checks(root):
     newer=fixture_folder(root/'newer',manifest)
     (newer/'package.json').write_text('{"name":"@snowluma/runtime","version":"9.9.9"}')
     rejected('unsupported_version',lambda:installer.inspect(str(newer)))
-    lite=fixture_folder(root/'lite',manifest);(lite/'node.exe').unlink()
+    lite=fixture_folder(root/'lite',manifest);runtime_node(lite).unlink()
     rejected('package_incomplete',lambda:installer.inspect(str(lite)))
     if os.name=='nt':
         import subprocess
@@ -205,7 +213,7 @@ def adapter_checks():
     assert '/api/agreements/record-consent' not in [p for _,p,_ in calls[before:]]
     failure[0]='auth';rejected('admin_auth_failed',lambda:api.initialize('fixture',manifest,lambda:None))
     rejected('admin_action_rejected',lambda:api.request('POST','/api/debug/invoke',{}))
-    print('PASS official v1.14.22 request shapes (mock): login, exact agreements hash, official consent, separate tokens, applied!=saved, auth failure, narrow action list')
+    print('PASS official '+manifest['version']+' request shapes (mock): login, exact agreements hash, official consent, separate tokens, applied!=saved, auth failure, narrow action list')
 
 
 def lifecycle_checks(root):
@@ -262,8 +270,8 @@ def lifecycle_checks(root):
         restored.use_external();assert restored.connection('http') is None
         # Two roots, multiple QQ, unknown account, no QQ, cancel/retry, stale choices.
         runtime.qq.clear();api.loaded.clear();second=new(root/'OtherTulpa');second.begin(accept(second));wait(second,'waiting_qq')
-        runtime.qq[202]=dict(pid=202,created=200,executable='C:/Fixture/QQ.exe');api.accounts_by_pid[202]=''
-        runtime.qq[303]=dict(pid=303,created=300,executable='C:/Fixture/QQ.exe');api.accounts_by_pid[303]='67890'
+        runtime.qq[202]=dict(pid=202,created=200,executable=QQ_EXE);api.accounts_by_pid[202]=''
+        runtime.qq[303]=dict(pid=303,created=300,executable=QQ_EXE);api.accounts_by_pid[303]='67890'
         s=wait(second,'choosing');assert len(s['choices'])==2 and s['choices'][0]['account_label']=='账号待验证'
         second.select(s['choices'][0]['id']);wait(second,'waiting_login');assert 303 not in api.loaded
         second.cancel();assert second.state()['phase']=='cancelled' and second.connection('http')['url']==''
@@ -288,7 +296,7 @@ def lifecycle_checks(root):
             assert client.post(route,json=b,headers={'X-ChatWeave-UI':'1','Origin':'https://foreign.invalid'}).status_code==403
             r=client.post(route,json=b,headers={'X-ChatWeave-UI':'1'}).json();assert r['code']=='selection_expired'
         # The default one-QQ flow proceeds without an extra process-picker step.
-        runtime.qq={101:dict(pid=101,created=400,executable='C:/Fixture/QQ.exe')};api.loaded.clear();api.accounts_by_pid[101]='12345'
+        runtime.qq={101:dict(pid=101,created=400,executable=QQ_EXE)};api.loaded.clear();api.accounts_by_pid[101]='12345'
         automatic=new(root/'Automatic');automatic.auto_select_single=True
         automatic.begin(accept(automatic));wait(automatic,'ready');automatic.cancel(revoke=True)
         constrained=new(root/'GrantMismatch');constrained.auto_select_single=True

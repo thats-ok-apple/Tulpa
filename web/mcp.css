@@ -4,7 +4,7 @@
 .mcp-dialog>.dialog-head{position:sticky;top:0;z-index:2;background:var(--panel);padding:14px 24px;margin:0;border-bottom:1px solid var(--line)}
 .mcp-dialog>.dialog-head>button,.mcp-panel-head>button{flex-shrink:0;white-space:nowrap}
 .mcp-body{padding:8px 24px 24px}.mcp-body p{font-size:14px;line-height:1.65}.mcp-muted{color:var(--muted)}
-.mcp-body h3{margin-top:24px;font-size:16px}.mcp-body input:not([type=checkbox]),.mcp-body textarea{display:block;width:100%;margin:6px 0 14px;padding:9px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit;box-sizing:border-box}
+.mcp-body h3{margin-top:24px;font-size:16px}.mcp-body input:not([type=checkbox]),.mcp-body textarea,.mcp-body select{display:block;width:100%;margin:6px 0 14px;padding:9px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:inherit;box-sizing:border-box}
 .mcp-step{border-bottom:1px solid var(--line);padding-bottom:20px}.mcp-background{display:flex;gap:8px;align-items:center;margin:16px 0}.mcp-warning{color:var(--warning)}.mcp-body [hidden]{display:none!important}
 .mcp-body input[type=checkbox]{width:16px;height:16px;flex-shrink:0;accent-color:var(--accent)}
 .mcp-body fieldset{border:1px solid var(--line);margin:16px 0;padding:12px;min-width:0}.mcp-body fieldset>label{display:flex;gap:8px;align-items:center;margin:8px 0}
@@ -31,3 +31,21 @@
 .mcp-learning-record{padding:16px 0;border-bottom:1px solid var(--line)}.mcp-learning-record h4{margin:0;font-weight:600}.mcp-learning-record p{margin:8px 0;line-height:1.7}.mcp-learning-record small{display:inline-block;margin-right:16px}.mcp-learning-record details{margin-top:12px}
 .mcp-learning>details{margin-top:24px}.mcp-learning>details>label{display:block;margin:16px 0}.mcp-empty{padding:20px 0;color:var(--muted)}
 @media(max-width:520px){.mcp-learning{padding:16px}.mcp-group-heading h3{font-size:18px}.mcp-active-run{align-items:flex-start}.mcp-dialog{width:94vw}.mcp-active-run p{width:100%;margin-bottom:0}}
+
+/* Compact, module-based connection editor. */
+.mcp-create-dialog{width:min(760px,94vw)}
+.mcp-body .permission-card{border:1px solid var(--line);border-radius:12px;margin:14px 0;overflow:hidden}
+.module-heading{display:flex;align-items:center;gap:12px;padding:16px;cursor:pointer;font-size:17px}.module-icon{display:grid;place-items:center;width:30px;height:30px;border:1px solid var(--line);border-radius:9px;font-size:14px;color:var(--muted)}
+.mcp-body .module-fields{margin:0;padding:0 18px 16px;border:0}.module-fields>label{padding:4px 0;font-size:14px}.module-fields>p{margin:4px 0 12px}
+.module-fields details{margin:10px 0}.module-fields details>label{display:flex;align-items:center;gap:8px;margin:12px 0}
+.mcp-body summary{cursor:pointer;font-size:14px}.qq-setup>summary{padding:8px 0}.qq-setup>summary span{margin-left:8px;font-size:12px}
+.mcp-body #mcp-create{width:100%;padding:13px;border-radius:9px;font-size:16px;margin:8px 0}
+.mcp-advanced{margin:20px 0}.mcp-advanced>summary{color:var(--muted)}.mcp-advanced>label{display:block;margin-top:16px}
+.mcp-body .import-warning{font-size:13px;margin:8px 0}.import-warning button{padding:2px 6px;font:inherit}
+.mcp-body fieldset[disabled]{opacity:.55}.mcp-body #mcp-scope-picker{border-radius:9px;font-size:14px}
+.mcp-body details #mcp-config{max-width:100%}.mcp-body #mcp-secret{border:0;margin:0;padding:0 0 16px}
+.mcp-confirm{max-width:400px;padding:24px}.mcp-confirm h2{font-size:19px}.mcp-confirm button{padding:8px 16px;margin:10px 10px 0 0}.mcp-confirm .danger-button{color:var(--danger)}
+.mcp-login-dialog{max-width:420px}.mcp-login-dialog .mcp-body{text-align:center;padding:22px}.mcp-login-dialog img{display:block;max-width:240px;width:100%;margin:12px auto}.mcp-login-dialog img[hidden]{display:none}.mcp-login-dialog details{margin-top:24px;text-align:left}
+.learning-group-row{display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:16px 0;border-bottom:1px solid var(--line)}.learning-group-row>div:first-child{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px;overflow-wrap:anywhere}.learning-group-row small{font-size:12px}.learning-active-run{display:flex;align-items:center;justify-content:space-between;width:100%;gap:10px;font-size:13px}
+.mcp-body [role=alert]:empty{display:none}
+@media(max-width:520px){.module-heading{padding:14px}.mcp-body .module-fields{padding:0 14px 14px}.mcp-dialog>.dialog-head{padding:14px 16px}.mcp-dialog .dialog-head h2{font-size:20px}.mcp-body .mcp-service{gap:10px}}

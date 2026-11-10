@@ -1,0 +1,309 @@
+"""数据形状与 TOON 编码。
+
+列表类数据以 TOON 表格串返回：表头声明列，其后逐行按列给值。列由数据类的字段派生，
+故字段顺序即表头顺序。
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, fields
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
+
+
+def space_url(mid: Any) -> str | None:
+    """UP 主 mid → 空间链接；没有 mid 就没有链接。"""
+    return f"https://space.bilibili.com/{mid}" if mid else None
+
+
+def to_local_time(ts: int | None) -> str | None:
+    """epoch 秒 → 本机时区的可读时间；0 与 None 同视为无时间戳，返回 None。
+
+    面向消费者（LLM）优化：给可读字符串而非数字时间戳。
+    """
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def bulky(use: str = "") -> dict[str, str]:
+    """字段 metadata：体积大、多数任务用不到，写进 jq 参数说明。use 写何时仍需要它。"""
+    return {"bulky": use}
+
+
+def _toon_needs_quote(s: str) -> bool:
+    """字符串是否需加引号。"""
+    if s == "" or s != s.strip():
+        return True
+    if s in ("true", "false", "null"):
+        return True
+    if any(c in s for c in (",", '"', "\\", ":", "[", "]", "{", "}", "\n", "\r", "\t")):
+        return True
+    if s[0] == "-":
+        return True
+    try:
+        float(s)
+        return True  # 形似数字的字符串加引号，避免被当成数值
+    except ValueError:
+        return False
+
+
+def _toon_cell(value: Any) -> str:
+    """把单个值编码成 TOON 行内单元格。转义序列依 TOON 规范。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else repr(value)
+    s = str(value)
+    if _toon_needs_quote(s):
+        esc = (
+            s.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
+        return f'"{esc}"'
+    return s
+
+
+def toon_table(name: str, rows: list[dict[str, Any]], columns: list[str]) -> str:
+    """把同构对象列表编码为 TOON 表格串。
+
+    缺失键或 None 留空：消费端靠列位置对齐，不能跳过。
+    """
+    header = f"{name}[{len(rows)}]{{{','.join(columns)}}}:"
+    lines = ["  " + ",".join(_toon_cell(r.get(c)) for c in columns) for r in rows]
+    return "\n".join([header, *lines]) if lines else header
+
+
+def to_toon(
+    name: str, items: list[Any], item_type: type, exclude: frozenset[str] = frozenset()
+) -> str:
+    """把数据类实例列表编码为 TOON 表格串。exclude 里的字段不出列。
+
+    item_type 显式传入：列表为空时无从取得元素类型，而空表也需要表头。
+    """
+    columns = [f.name for f in fields(item_type) if f.name not in exclude]
+    return toon_table(name, [asdict(it) for it in items], columns)
+
+
+class QrStatus(StrEnum):
+    """扫码登录的轮询状态。与"当前是否已登录"是两回事，后者见 BilibiliClient.get_login_status。"""
+
+    WAITING = "waiting"   # 尚未扫码
+    SCANNED = "scanned"   # 已扫，待手机确认
+    EXPIRED = "expired"   # 二维码超时
+    SUCCESS = "success"
+
+
+@dataclass(frozen=True, slots=True)
+class QrLoginSession:
+    key: str
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoginCheckResult:
+    status: QrStatus
+    cookie: str = ""
+
+
+@dataclass(slots=True)
+class Page[Item]:
+    """分页取回的一批条目 + 续取状态。
+
+    令牌是否透明由各能力实现决定，调用方一律原样递回。
+    """
+
+    items: list[Item]
+    has_more: bool = False
+    next_cursor: str | None = None
+    rate_limited: str | None = None  # 中途触发风控时给调用方的说明；有值时这批只有风控前取到的部分
+    from_cache: bool = False
+    cached_at: str | None = None  # 来自缓存时的抓取时间
+
+
+@dataclass(slots=True)
+class Comment:
+    """一条评论。二级评论由 get_comment_replies 单独钻取，不内嵌于此。
+
+    content 是平台原文：评论里的配图与链接标题另立字段，不改写原文。
+    """
+
+    id: str
+    author: str
+    # 评论者空间链接，可传给 get_up_info / list_up_videos
+    author_url: str | None = field(metadata=bulky("查看评论者资料时需要"))
+    author_level: int | None  # 评论者的账号等级 0~6
+    is_up: bool = field(metadata=bulky())  # 评论者是该视频的 UP 主本人
+    ip_location: str | None  # IP 属地（省份或国家）；较早的评论平台不给
+    content: str
+    like_count: int
+    reply_count: int
+    parent_id: str | None  # 被回复的那条评论 id；仅二级评论"互回"时出现（直接回复主评论则为 None）
+    created_at: str | None = field(metadata=bulky())  # 本机时区可读时间（见 to_local_time）
+    is_top: bool = field(metadata=bulky())  # 置顶评论
+    up_liked: bool = field(metadata=bulky())  # UP 主给这条点过赞
+    image_urls: str | None  # 配图地址，多张以换行分隔
+    link_titles: str | None  # content 里的链接对应的标题，多个以换行分隔
+
+
+@dataclass(slots=True)
+class ReplyThread:
+    """对某条主评论钻取二级评论的一次结果。comment_id 是分组键。"""
+
+    comment_id: str
+    page: Page[Comment]
+    withheld: int = 0  # 平台声称有、却不肯列出的二级评论条数（见 _comments._withheld_count）
+    total: int | None = None  # 平台能列出的二级评论总数，用来算页数
+    error: str | None = None  # 这条主评论取不到时的原因，此时 page 为空
+
+
+@dataclass(slots=True)
+class ReplyBatch:
+    """一次二级评论调用的全部结果，整批缓存。"""
+
+    threads: list[ReplyThread]
+    from_cache: bool = False
+    cached_at: str | None = None  # 来自缓存时的抓取时间
+
+
+@dataclass(slots=True)
+class SearchItem:
+    """搜索结果的一条。url 可直接传给内容类工具。"""
+
+    title: str
+    url: str
+    author: str | None
+    # UP 主空间链接，可传给 list_up_videos
+    author_url: str | None = field(metadata=bulky("查看 UP 主时需要"))
+    published_at: str | None  # 本机时区可读时间
+    duration_sec: float | None  # 时长秒数（平台给的是"总分钟:秒"文本，已换算）
+    category: str | None  # 分区名
+    tags: str | None = field(metadata=bulky())  # 标签，逗号分隔
+    summary: str | None = field(metadata=bulky())  # 简介，平台截断在约 250 字
+    view_count: int | None
+    danmaku_count: int | None
+    comment_count: int | None
+    like_count: int | None
+    favorite_count: int | None
+
+
+@dataclass(slots=True)
+class FeedItem:
+    """首页推荐流的一条。url 可直接传给内容类工具。"""
+
+    title: str
+    url: str
+    author: str | None
+    author_url: str | None = field(metadata=bulky("查看 UP 主时需要"))  # UP 主空间链接
+    published_at: str | None  # 本机时区可读时间
+    duration_sec: float | None  # 时长秒数
+    view_count: int | None
+    danmaku_count: int | None
+    like_count: int | None
+    rcmd_reason: str | None  # 平台给的推荐理由，多数条目没有
+
+
+@dataclass(slots=True)
+class UpVideoItem:
+    """UP 主投稿列表的一条。url 可直接传给内容类工具。"""
+
+    title: str
+    url: str
+    published_at: str | None  # 本机时区可读时间
+    duration_sec: float | None  # 时长秒数
+    view_count: int | None
+    danmaku_count: int | None
+    comment_count: int | None
+
+
+@dataclass(slots=True)
+class SubtitleEntry:
+    """一条字幕。时间轴单位为秒，保留一位小数。"""
+
+    start: float = field(metadata=bulky("需要定位时间时保留"))
+    end: float = field(metadata=bulky())
+    content: str
+
+
+@dataclass(slots=True)
+class VideoPart:
+    """多段视频的一段。"""
+
+    page: int  # 分段序号，1 起
+    part: str | None  # 该段标题
+    duration: float | None  # 该段时长秒数
+
+
+@dataclass(slots=True)
+class PartDanmakuCount:
+    """一段的弹幕数。取不到时 danmaku_count 为空，error 写原因。"""
+
+    page: int  # 分段序号，1 起
+    part: str | None  # 该段标题
+    duration: float | None  # 该段时长秒数
+    danmaku_count: int | None
+    cached_at: str | None = None  # 来自缓存时的抓取时间
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class VideoInfo:
+    """视频元信息。字段口径写在 server.py 的工具 description 里。"""
+
+    id: str
+    title: str
+    author: str | None = None
+    author_url: str | None = field(default=None, metadata=bulky("查看 UP 主时需要"))
+    url: str | None = None
+    published_at: str | None = None
+    summary: str | None = None
+    staff: str | None = None                   # 仅联合投稿有值，"名字(角色,mid)" 以分号分隔
+    duration_sec: float | None = None          # 多段视频为当前段
+    total_duration_sec: float | None = None    # 多段视频为全部分段之和
+    view_count: int | None = None
+    danmaku_count_total: int | None = None     # 多段视频为全部分段之和
+    comment_count: int | None = None           # 含二级评论
+    like_count: int | None = None
+    favorite_count: int | None = None
+    share_count: int | None = None
+    coin_count: int | None = None
+    cover_url: str | None = field(default=None, metadata=bulky())
+    part_count: int | None = None
+    current_page: int | None = None            # 仅多段视频有值
+    current_part: str | None = None            # 仅多段视频有值
+
+
+@dataclass(slots=True)
+class UpInfo:
+    """UP 主资料。字段口径写在 server.py 的工具 description 里。"""
+
+    mid: int
+    author: str | None = None
+    author_url: str | None = field(default=None, metadata=bulky("给出空间链接时需要"))
+    sign: str | None = None
+    sex: str | None = None
+    level: int | None = None
+    follower_count: int | None = None
+    following_count: int | None = None
+    like_count: int | None = None
+    official_type: str | None = None
+    official_title: str | None = None
+    vip: str | None = None
+    face_url: str | None = field(default=None, metadata=bulky())
+
+
+@dataclass(slots=True)
+class Batched[Item]:
+    """批量调用里一项输入的结果：取到时 value 有值，否则 error 写原因。"""
+
+    input: str
+    value: Item | None = None
+    error: str | None = None

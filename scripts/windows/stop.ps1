@@ -1,5 +1,6 @@
 $ErrorActionPreference='Stop'
-$appPath=Join-Path $PSScriptRoot 'app.py'
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$appPath=Join-Path $repoRoot 'app_mcp.py'
 $matches=Get-CimInstance Win32_Process | Where-Object {
     $_.Name -match '^python' -and $_.CommandLine -and $_.CommandLine.Contains($appPath)
 }

@@ -13,6 +13,8 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).parent))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from check_mcp_reactions import ReactionBot, Events, eventually, ROOT
 from check_mcp_language_learning import ground_fixture_rows
 from chatlocal.store import Store
@@ -51,9 +53,9 @@ async def wire(service,connection,sid,ui):
                     return await call('plan_chat_reply',session_id=sid,batch_id=packet['input_batch']['id'],
                         action=action,expressions=list(expressions),target_event_id=target['id'],
                         intent='合成测试意图',idempotency_key=f'usage-plan-{serial}')
-                async def send(p,bubbles=None):
+                async def send(p,bubbles=None,**extra):
                     return await call('send_chat_reply',session_id=sid,plan_id=p['plan_id'],
-                        bubbles=bubbles or [dict(kind='text',text='仅发送给本机模拟 OneBot')])
+                        bubbles=bubbles or [dict(kind='text',text='仅发送给本机模拟 OneBot')],**extra)
                 async def select(p,ids):
                     return await call('select_chat_expressions',session_id=sid,plan_id=p['plan_id'],expression_ids=ids)
                 def pause(value):
@@ -63,11 +65,13 @@ async def wire(service,connection,sid,ui):
                 assert p['next_call']['tool']=='send_chat_reply' and p['expression_selection']['reason']=='insufficient_expressions'
                 assert (await send(p))['state']=='SUCCEEDED'
                 seed(10);p=await plan();before=len(ReactionBot.sent)
-                assert p['phase']=='SELECTING_EXPRESSION' and p['next_call']['tool']=='select_chat_expressions'
+                assert p['phase']=='SELECTING_EXPRESSION' and p['next_call']['tool']=='send_chat_reply'
+                assert p['next_call']['requires']==['expression_ids','bubbles']
+                assert p['learned_language']['send_call']['tool']=='send_chat_reply'
                 assert p['expression_selection']['state']=='pending'
                 blocked=await send(p)
                 assert blocked['error_code']=='expression_selection_required' and len(ReactionBot.sent)==before,blocked
-                assert blocked['recovery']['next_call']['tool']=='select_chat_expressions'
+                assert blocked['recovery']['next_call']['tool']=='send_chat_reply'
                 # The legacy single-send path uses the same gate.
                 legacy=await call('send_chat_message',session_id=sid,plan_id=p['plan_id'],text='cannot bypass',idempotency_key='usage-legacy')
                 assert legacy['error_code']=='expression_selection_required' and len(ReactionBot.sent)==before
@@ -80,6 +84,63 @@ async def wire(service,connection,sid,ui):
                 assert completed['state']=='SUCCEEDED' and completed['expression_selection']['state']=='none'
                 assert (await send(p))['state']=='SUCCEEDED' and len(ReactionBot.sent)==before+1
                 print('PASS 9/10 threshold, wire discovery, explicit empty choice, legacy gate, unknown IDs and replay')
+
+                # The next model pass chooses references and writes the reply in
+                # one public HTTP call; no extra selector call is needed.
+                p=await plan();before=len(ReactionBot.sent)
+                invalid=await send(p,expression_ids=['f'*32])
+                assert invalid['error_code']=='invalid_selection' and len(ReactionBot.sent)==before
+                completed=await send(p,expression_ids=[])
+                assert completed['state']=='SUCCEEDED' and completed['expression_selection']['state']=='none'
+                assert (await send(p,expression_ids=[]))['state']=='SUCCEEDED' and len(ReactionBot.sent)==before+1
+                assert (await send(p,expression_ids=[p['learned_language']['candidates'][0]['id']]))['error_code']=='idempotency_conflict'
+                p=await plan();ids=[x['id'] for x in p['learned_language']['candidates'][:2]]
+                completed=await send(p,expression_ids=ids)
+                assert completed['state']=='SUCCEEDED' and completed['expression_selection']['selected_ids']==ids
+                assert completed['expression_selection']['candidate_context']['sha256']
+                assert completed['expression_selection']['selected_context']['sha256']
+                p=await plan()
+                legacy=await call('send_chat_message',session_id=sid,plan_id=p['plan_id'],
+                    text='兼容单条入口也可以随正文选择',expression_ids=[],idempotency_key='inline-legacy')
+                assert legacy['state']=='SUCCEEDED'
+                from chatlocal.message_sender import SendUncertain,QQSender
+                p=await plan();before=len(ReactionBot.sent)
+                with patch.object(QQSender,'send',side_effect=SendUncertain('fixture unknown')) as dispatch:
+                    unknown=await send(p,expression_ids=[])
+                    assert unknown['state']=='UNKNOWN' and dispatch.call_count==1
+                    assert (await send(p,expression_ids=[]))['state']=='UNKNOWN' and dispatch.call_count==1
+                assert len(ReactionBot.sent)==before
+                print('PASS inline empty/selected choices, foreign rejection, immutable retry, legacy compatibility and UNKNOWN no redispatch')
+
+                # Normal wire path after a wait result needs exactly two
+                # decision tool calls, including an actual candidate choice.
+                seed(10)
+                with service.access.connect() as db:
+                    offered=db.execute('SELECT offered FROM chat_sessions WHERE id=?',(sid,)).fetchone()[0]
+                fixture=dict(post_type='message',message_type='group',self_id=111,group_id=222,user_id=333,
+                    message_id=-987654,message_seq=987654,sender={'user_id':333},time=int(time.time()),
+                    message=[dict(type='text',data={'text':'two pass fixture'})])
+                ReactionBot.history['-987654']=deepcopy(fixture);tools.chat.receive(fixture)
+                packet=await call('wait_chat_messages',session_id=sid,acknowledge_through_id=offered,timeout_seconds=1)
+                assert packet['messages'][-1]['content']=='two pass fixture'
+                assert 'reactions' not in packet['chat_guidance'] and 'chat_prompt' not in packet
+                # Message bodies/history are intentionally not capped to meet
+                # a host-specific file threshold; only guidance is compacted.
+                assert len(json.dumps(packet['chat_guidance'],ensure_ascii=False,separators=(',',':')))<2500
+                with service.access.connect() as db:last_call=db.execute('SELECT max(id) FROM calls').fetchone()[0]
+                p=await call('plan_chat_reply',session_id=sid,batch_id=packet['input_batch']['id'],action='reply',
+                    target_event_id=packet['messages'][-1]['id'],expressions=['text'],intent='two pass fixture')
+                assert p['quote_guidance']['threshold']==3 and p['quote_guidance']['messages_after_target']==0
+                assert not p['quote_guidance']['quote_recommended']
+                ids=[p['learned_language']['candidates'][0]['id']]
+                out=await send(p,expression_ids=ids,bubbles=[dict(kind='text',text='fixture quoted reply',quote=True)])
+                assert out['state']=='SUCCEEDED' and ReactionBot.sent[-1]['message'][0]==dict(type='reply',data=dict(id='-987654'))
+                with service.access.connect() as db:
+                    called=[r[0] for r in db.execute("SELECT tool FROM calls WHERE id>? AND tool!='chat_expression' ORDER BY id",(last_call,))]
+                assert called==['plan_chat_reply','send_chat_reply'],called
+                full=await call('wait_chat_messages',session_id=sid,timeout_seconds=1,response_format='full')
+                assert 'reactions' in full['chat_guidance']
+                print('PASS compact wait -> plan -> inline select/send: exactly two decision calls; full diagnostics available')
 
                 p=await plan();ids=[x['id'] for x in p['learned_language']['candidates'][:2]]
                 args=dict(session_id=sid,plan_id=p['plan_id'],expression_ids=ids)
@@ -114,12 +175,12 @@ async def wire(service,connection,sid,ui):
                 assert ids[0] not in [x['id'] for x in out['learned_language']['candidates']]
                 await select(p,[]);assert (await send(p))['state']=='SUCCEEDED'
                 p=await plan();pause(True)
-                out=await send(p);assert out['state']=='SUCCEEDED' and out['expression_selection']['reason']=='learning_disabled'
+                out=await send(p,expression_ids=[]);assert out['state']=='SUCCEEDED' and out['expression_selection']['reason']=='learning_disabled'
                 pause(False)
                 # Learning-storage failure cannot silently masquerade as a model
                 # choice or stop otherwise authorized ordinary conversation.
                 with patch.object(learning.store,'context',side_effect=OSError('fixture storage failure')):
-                    p=await plan();out=await send(p)
+                    p=await plan();out=await send(p,expression_ids=[])
                     assert out['state']=='SUCCEEDED' and out['expression_selection']['state']=='unavailable'
                     assert out['expression_selection']['reason']=='learning_unavailable'
                 silent=await plan(expressions=(),action='silence')
@@ -165,7 +226,7 @@ def main():
         assert address[0] in ('127.0.0.1','localhost','::1') and address[1] in ports,address
         return connect(address,*args,**kw)
     try:
-        with tempfile.TemporaryDirectory(prefix='tulpa-language-usage-') as tmp,patch.dict('os.environ',{},clear=True),patch('socket.create_connection',restrict):
+        with tempfile.TemporaryDirectory(prefix='tulpa-language-usage-') as tmp,patch.dict('os.environ',isolated_env(),clear=True),patch('socket.create_connection',restrict):
             root=Path(tmp);store=Store(root/'chats.sqlite3')
             (root/'.env').write_text(f'REPLY_ONEBOT_URL=http://127.0.0.1:{server.server_port}\nREPLY_ONEBOT_WS_URL=ws://127.0.0.1:{events.port}\nREPLY_ONEBOT_WS_TOKEN=event-fixture\n','utf-8')
             with patch('chatlocal.onebot.ROOT',root),patch('chatlocal.message_sender.ROOT',root):

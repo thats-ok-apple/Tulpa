@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
-sys.path[:0]=[str(ROOT),str(ROOT/'tools/qq-reader'),str(ROOT/'tools/wechat-reader')]
+sys.path[:0]=[str(ROOT),str(ROOT/'scripts'),str(ROOT/'tools/qq-reader'),str(ROOT/'tools/wechat-reader')]
 from chatlocal.config import DATA
 os.environ['CHATLOG_KEEPER_DATA_DIR']=str(DATA/'qq-reader')
 os.environ['WECHATAUTO_KEYS_DIR']=str(DATA/'wechat-reader/keys')
@@ -13,16 +13,19 @@ from chatlocal.media import media_path,media_at,is_sticker
 from reader_media import QQMedia,WeChatMedia
 
 
-def parser_for(platform,stickers):
+def parser_for(platform,stickers,*,live=False):
     if platform=='qq':
         import chatlog_keeper.qq_db as q
         meta=json.loads((DATA/'qq-snapshot-info.json').read_text('utf-8'))
         return QQMedia(q,meta['source'],load_stickers=stickers),meta['account']
-    from wechatauto.db import WeChatDB
+    if live:
+        from live_wechat import LiveWeChatDB as WeChatDB
+    else:
+        from wechatauto.db import WeChatDB
     meta=json.loads((DATA/'wechat-snapshot-info.json').read_text('utf-8'))
     reader=WeChatDB(db_dir=str(Path(meta['source_db']).parent.parent),account=meta['account'],
         workdir=str(DATA/'wechat-reader/work'),keys_file=str(DATA/'wechat-reader/keys.json'))
-    return WeChatMedia(reader,meta,load_stickers=stickers),meta['account']
+    return WeChatMedia(reader,meta,load_stickers=stickers,live=live),meta['account']
 
 
 def recover(payload,parser,account):
@@ -60,6 +63,7 @@ def recover(payload,parser,account):
             if eligible and (stickers or kind=='image') and item.get('status') in ('unavailable','omitted') and not metadata.get('md5') and not row.get('_wechat_raw'):
                 missing_locator=True
             items.append(item)
+            if prior and item.get('reason_code')!=prior.get('reason_code') and item.get('status')=='unavailable':changed=True
         if missing_locator:stats['metadata_missing_messages']+=1
         if changed:
             for key in ('_wechat_raw','_message_id','_omitted_before','_media_before'):raw.pop(key,None)

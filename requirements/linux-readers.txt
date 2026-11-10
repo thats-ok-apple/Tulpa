@@ -1,0 +1,2 @@
+-r linux.txt
+numpy==2.5.3

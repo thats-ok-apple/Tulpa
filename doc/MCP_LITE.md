@@ -1,68 +1,40 @@
-# Tulpa MCP 轻量版
+# Tulpa MCP 版
 
-从旧版本升级：先看 [保留数据升级教程](UPGRADE.md)，可将其中的指令交给本机 Codex / DSH。原目录更新会保留 MCP 端口、凭据和读取进度，无需重新导入；新增能力仍需主动授权。
-
-0.5.0 新增独立 MCP 版。解压 `Tulpa-MCP-0.5.0-win-x64.zip` 后，打开 `Tulpa/Tulpa.exe`。不需要安装 Python、Node，也不需要在 Tulpa 填写模型 API Key。
-
-## 保留和移除
-
-已加入 [SnowLuma 实时持续群聊](MCP.md#持续群聊snowluma-实时事件)：外部 Agent 输入人格后参与指定群，可随时停止。无需导入历史聊天或开启数据库实时读取；配置 OneBot HTTP 与 WebSocket 事件节点后即可使用。完整应用的 MCP 共用实现，不调用内置 Harness。
-
-持续群聊下另有可选的[表情包权限](MCP.md#表情包子功能)：实时看图片/动图、检索 QQ 收藏、记用途、发送原动画，以及真正收藏到 QQ。三项权限独立勾选，不升级已有授权；停止群聊也停止后续表情操作。未添加模型、Office 或其他重型依赖。
-
-保留 QQ / 微信导入、账号选择、分批进度、实时读取、聊天浏览器、文件下载、OneBot 设置、MCP 授权及托盘服务。聊天窗口仍每 2 秒刷新已经入库的消息。本地语音转写模型在首页「可选组件」一键安装，显示进度、支持取消；下载约 181 MB，完成后核对固定 SHA256，之后可离线使用。失败可重试，不替换已有模型，也不会上传语音。
-
-不包含内置 DeepSeek Harness、Gradio、内置聊天/回复生成/工作区界面，不启动另一个回答模型。图片像素交给外部 Agent 理解；不附带本地 OCR、Office 解析框架、科学计算依赖或语音模型。主包保留 FFmpeg，用于读取微信 HEVC 图片，而不是为了运行模型。
-
-## 原文件交给外部 Agent
-
-1. `list_conversations` 核对完整会话编号；`read_qq_group(view="files")` 获取允许范围内的实际群文件目录。
-2. `download_file(file_id=...)` 通过 OneBot 下载原文件，或取得已经缓存的文件本体。返回 `local_path`、原始文件名、大小与 SHA256；不要求文件先通过解析，不执行或解压内容。
-3. 同一台电脑上的 Codex / DSH 使用自身文件、Shell 或文档能力读取这个路径，完成分析。MCP 没有替外部 Harness 提供任意本机文件读取权限。
-
-聊天附件记录与群文件目录是不同来源，不能只凭同名自动绑定。聊天附件缺失时，应查询群目录再使用目录返回的编号；过期、已删除或无权限的文件仍可能下载失败。下载每个最多 32 MiB，与按需文字提取合计每小时 12 次。群目录受连接的会话与日期范围限制，日期未知的文件不会越过日期过滤。
-
-`prepare_file` 保留轻便的 PDF / 纯文本提取，已有索引仍可搜索；轻量版不内置 Office 解析。DOCX / PPTX / XLSX 等由外部 Agent 读取原文件，能否理解具体格式取决于该 Harness 的工具。`local_path` 位于 Tulpa 所在电脑，其他电脑或云端客户端不能直接使用这个路径。
-
-Windows 10 / 11 x64、.NET Framework 4.8。轻量版使用系统 **Microsoft Edge WebView2 Evergreen Runtime**，不重复附带固定浏览器。若启动提示缺少组件，请到 [微软官方下载页](https://developer.microsoft.com/microsoft-edge/webview2/) 安装 x64 Evergreen Runtime，再打开 EXE。完整版本仍自带固定浏览器。
+0.5.7 只发布 MCP 版，复用 Codex、DeepSeek Harness、Claude Code 等外部 Agent，不运行第二个回答模型。旧完整版停止维护。Linux 使用原 CLI/TUI，见 [Linux 教程](https://github.com/fumingyang2004/Tulpa/blob/v0.5.7/doc/LINUX.md)。
 
 ## 第一次使用
 
-1. 登录本机 QQ / 微信，打开 **数据与同步**，选择账号，导入需要的会话和日期。可勾选读取范围内全部消息，程序内部按批次完成。实时读取独立设置。
-2. 需要 QQ 群资料或写操作时，先启动自己的 SnowLuma 等 OneBot 服务。在 **OneBot 设置** 填写本机 URL 和 Token，点击保存并检测。[取得 URL 和 Token 的逐步教程](SNOWLUMA_SETUP.md)。发布包不附带 SnowLuma。
-3. 打开 **连接外部 Agent**，填写名称，选择平台、会话和日期。默认不授权全部会话，也不开放媒体处理或 QQ 写操作。
-4. 按需勾选权限。发送和群管理位于 OneBot 读取权限的下方，两项独立设置。
-5. 点击 **开启服务并创建连接**（服务已经运行时为 **创建连接凭据**），检测连接。复制配置到支持 Streamable HTTP MCP 的客户端；Codex 可以点击写入本机配置，DeepSeek Harness 按 [部署教程](DEEPSEEK_MCP.md) 配置。
-6. 重新连接外部 Agent。保持 Tulpa 和需要使用的 QQ / OneBot 服务运行；勾选留在托盘后，关闭窗口仍可继续服务。
+Windows 完整解压 `Tulpa-MCP-0.5.7-win-x64.zip`，打开 `Tulpa/Tulpa.exe`。需要 .NET Framework 4.8 和系统 WebView2 Evergreen Runtime，不需要另外安装 Python 或 Node。
 
-## 勾选就是持续授权
+1. 首页点击 **开始创建链接**，按需要启用 QQ、微信、哔哩哔哩模块。
+2. 在对应模块勾选能力。仅使用实时 QQ、水群或 B站时，不需要导入聊天资料；只有选中历史读取时才要求对应平台已有资料。
+3. QQ 模块内勾选 SnowLuma 协议并点击 **一键配置**；B站从左侧账号设置扫码。已有连接可在高级选项导入。
+4. 点击 **一键开启 MCP**，名称可留空。将生成的配置交给外部 Agent，重新连接并刷新工具列表。
+5. 首页连接列表可以折叠，每条连接可单独启停或删除。左侧 **QQ 学习管理** 按机器人 QQ 与群号管理积累。
 
-**允许直接发送 QQ 消息**：Agent 可以向该连接范围内的 QQ 群或已核对好友发送纯文本。**允许直接执行 QQ 群管理**：Agent 可以按当前账号权限执行禁言、解禁、移出成员、改群名和处理入群申请。
+Windows 命令行打开 `Tulpa.CLI.exe`，支持配置和调用同一套已授权 MCP 工具，见 [CLI 教程](MCP_CLI.md)。GUI 与 CLI 共用本安装的服务、授权和数据。
 
-开启后立即执行工具调用，**不会创建提案，也不用回 Tulpa 逐项批准**。未勾选的连接看不到对应写工具。原有只读连接不会因升级自动获得写权限。平台、会话、日期与本人账号检查继续生效；普通发送和群管理目标须在授权日期内有已导入的消息；持续群聊通过独立实时群目录和授权校验，不要求导入历史。管理检查使用当前真实群权限。
+## 能力
 
-每次写操作需要稳定的 `idempotency_key`。同一连接重复提交同一个编号、同一内容，返回已有结果；换内容会被拒绝。操作记录持久保存发送文字、目标、时间、QQ 回执及状态，只有 Token 哈希入库。超时或服务中断标为 `UNKNOWN`，程序不自动重发，先核对真实 QQ 状态。记录不改写原始聊天数据。
+- QQ / 微信：按授权范围读取已导入的聊天和附件；只有 QQ 提供发送与群管理。
+- 实时 QQ：使用 OneBot HTTP 与正向 WebSocket，支持持续群聊、人格、@、引用、图片、表情包、消息表情回应及按账号和群保存的学习库。
+- B站：搜索、推荐、详情、字幕/可选本地 ASR、真实画面与评论，只读。原生视频卡片跳转未通过验收，创建界面不开放分享入口。[B站说明](BILIBILI_MCP.md)
+- 文件：可经 OneBot 下载授权群文件，将原文件路径交给同机 Agent 的文件工具。不会因为下载而自动执行文件。
 
-在 **已授权连接** 撤销即可停止后续调用。需要更改范围或权限时撤销旧连接并重建。已执行的消息或管理操作不能通过撤销凭据收回。
+Windows MCP 包不附带 Gradio、内置 Harness、OCR/Office 框架或语音模型。保留 FFmpeg 与媒体后端；已安装的可选模型可继续使用，首页不再显示组件下载模块。模型是否能看图、是否持续执行及其工具审批由宿主决定。
 
-外部客户端可以有自己的审批政策。对于勾选写权限的连接，Tulpa 生成的 Codex 配置只为相应工具添加 `approval_mode = "approve"`，不修改其他服务器或全局策略；这是 [Codex 官方支持的单工具配置](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。管理员强制策略仍可能限制它。其他 Harness 按自身方式授权，Tulpa 不要求返回本机页面确认。
+## 授权与连接
 
-## 工具数量
+三个模块的总开关独立；关闭模块时，其中的遗留选项不会进入新授权。发送、收藏、reaction 和群管理按能力分别授权，升级不会自动开放新权限。可见工具由当前连接实际权限和依赖状态决定，以 `tools/list` 为准。
 
-全部读取权限且 OneBot 在线时为 24 个读取/本地处理工具（包括 `download_file`）。增加两项写权限后共 27 个：新增 `send_qq_message`、`manage_qq_group`、`get_qq_operation`。群管理权限还允许 `read_qq_group(view="requests")` 读取入群申请。权限未开或 OneBot 离线时，工具列表相应缩小。[工具表](MCP.md)。
+写权限属于持续授权：符合范围的调用会直接执行，不会逐次返回 Tulpa 弹窗。发送仍保留目标校验、限流和幂等；结果未知时不自动重发。暂停或删除连接会停止后续访问，无法撤回已交给 QQ 的操作。
 
-## 数据与升级
+## 升级与数据
 
-公开 ZIP 不包含聊天数据库、密钥、连接 Token 或测试记录。本机数据位于自己的程序目录；不要分享使用过的整个文件夹。
+按 [保留数据升级](UPGRADE.md) 使用新版 `scripts/upgrade_installation.py` 更新原 MCP 安装。先从托盘彻底退出并备份；保留数据、附件、授权、学习库和自改人格，升级后重新连接 MCP。新包没有任何账号或登录凭据，不要分享使用过的整个程序目录。
 
-开发版、完整版本和轻量版的资料、配置各自独立。第一次使用可以放到新目录；升级已有轻量版请按 [升级教程](UPGRADE.md) 用新包更新原安装目录，保留全部私人目录、原端口和授权。不要仅复制数据库后丢掉附件或旧路径。切换版本类型、合并两个使用过的目录不在升级工具的支持范围。两个实例不能同时共用同一个数据目录或 MCP 端口。
+## 开发与打包
 
-## 从源码与打包
+安装 `requirements/mcp.txt` 后运行 `python app_mcp.py`，访问 `http://127.0.0.1:7861/`。可选历史读取器和构建依赖见 [构建说明](DESKTOP.md)。
 
-已安装项目开发依赖时：`python app_mcp.py`，访问 `http://127.0.0.1:7861/`。完整开发页继续使用原 `start.ps1`。
-
-准备固定读取器和桌面依赖后，执行 `python desktop/build.py --mcp-only`。默认生成 `release/<版本>-mcp/Tulpa/` 与 `release/Tulpa-MCP-<版本>-win-x64.zip`。仅复制 `requirements/mcp.txt` 的实际依赖闭包，不会从使用过的 data 目录打包个人内容。`--qa --no-zip --output release/qa-mcp/Tulpa` 可构建隔离验收版本。构建完整包的原命令保持可用。
-
-`scripts/check_mcp_actions.py` 使用隔离 OneBot 服务检查直接授权、会话/日期/角色隔离、撤销、并发重复发送、未知结果不重试和操作记录；测试中的踢人只发生在夹具，不操作真实账号。
-
-本机真实与隔离验收结果见 [VALIDATION.md](VALIDATION.md#050-mcp-轻量版本机验收)。MCP 下载原文件可用，不代表外部 Harness 已配置好所有文档解码工具或 Shell 权限。
+使用 `python desktop/build.py --mcp-only` 构建 Windows MCP 包，`--bundle-snowluma` 可加入经固定哈希校验的未初始化官方运行包。正式构建要求干净 Git 提交；归档按清单生成，不复制个人数据。Linux 使用 `scripts/build_linux_release.py` 生成 MCP 终端源码包，不复制 Windows 运行时。

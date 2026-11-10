@@ -23,6 +23,9 @@ static class Program {
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd,uint msg,IntPtr w,IntPtr l);
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [STAThread] static void Main(string[] args) {
+        if(args.Length==1 && args[0]=="--cli") {
+            Process.Start(new ProcessStartInfo(Path.Combine(Root,"Tulpa.CLI.exe")){WorkingDirectory=Root,UseShellExecute=true});return;
+        }
         Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
         SetProcessDPIAware();
         try {
@@ -71,6 +74,8 @@ sealed class DesktopWindow:Form {
         tray.Icon=Icon;tray.Text="Tulpa · 本机资料服务";
         var menu=new ContextMenuStrip();
         menu.Items.Add("打开 Tulpa",null,delegate{ShowWindow();});
+        if(File.Exists(Path.Combine(Program.Root,"Tulpa.CLI.exe")))
+            menu.Items.Add("打开命令行",null,delegate{Process.Start(new ProcessStartInfo(Path.Combine(Program.Root,"Tulpa.CLI.exe")){WorkingDirectory=Program.Root,UseShellExecute=true});});
         if(Program.Connect=="") {
             var startup=new ToolStripMenuItem("开机启动（当前文件夹）");startup.CheckOnClick=true;
             using(var key=Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))

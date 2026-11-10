@@ -1,0 +1,14 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tulpa · B站与 QQ 分享</title>
+<style>body{font:16px/1.65 system-ui,sans-serif;color:#242421;background:#faf9f6;margin:0}main{max-width:900px;margin:auto;padding:32px 22px}h1{font-size:29px}h2{font-size:21px}section{border:1px solid #dedbd4;border-radius:12px;padding:22px;margin:20px 0;background:white}button,input,textarea{font:inherit}button{padding:9px 15px;margin:8px 8px 8px 0;border:1px solid #cbc8c0;border-radius:7px;background:white;cursor:pointer}button.primary{background:#21211d;color:white}button:disabled{opacity:.5;cursor:wait}label{display:block;margin:10px 0}input[type=checkbox]{margin-right:8px}textarea{width:100%;box-sizing:border-box}small,.muted{color:#65655f}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;background:#f4f3ef;padding:12px}#error{color:#9e3519;white-space:pre-wrap}#qr{width:220px;max-width:100%}.pending{border-top:1px solid #ddd;padding-top:12px}a{color:#38526b}details{margin:12px 0}#status{min-height:26px}@media(max-width:550px){main{padding:12px}section{padding:15px}h1{font-size:24px}}</style>
+<script src="/bilibili/ui.js" defer></script></head><body><main>
+<a href="/">← 返回 Tulpa</a><h1>B站账号与媒体设置</h1><p>让 Agent 搜索、看字幕与真实画面，再按你的要求分享视频。独立于持续水群，不监听群消息，不需要导入聊天数据。</p>
+<p id="error" role="alert"></p><p id="status" role="status">正在检查本地服务…</p>
+<section><h2>1. B站登录</h2><p id="login-state"></p><p>只读取搜索、推荐、详情、字幕和评论；没有点赞、投币、收藏、评论、关注或私聊操作。</p>
+<label><input type="checkbox" id="login-consent">允许此模块通过 B站扫码登录，凭据仅保存到本机受保护目录</label>
+<button id="login" class="primary">开始扫码登录</button><button id="logout">退出并清理 B站登录与媒体缓存</button><p id="qr-state" role="status"></p><img id="qr" alt="请使用 B站 App 扫码登录" hidden>
+<details><summary>媒体读取与本地资源</summary><p>优先用平台字幕。视频媒体默认匿名读取；需要登录的媒体可单独授权。B站扫码凭据不会自动复制给媒体模块。</p>
+<label>媒体专用 Cookie（可留空，输入不会出现在 Agent 工具结果中）<textarea id="media-cookie" rows="2" autocomplete="off"></textarea></label>
+<label><input id="media-consent" type="checkbox">我同意将上方凭据仅用于这组工具的媒体读取</label><button id="save-media">保存媒体凭据</button><button id="clear-cache">清理媒体缓存</button><pre id="limits"></pre>
+<p class="muted">ASR 默认复用 Tulpa 的本地 Whisper 语音组件（可在首页一键安装），无需新增模型服务或 API Key。高级配置也支持本地 faster-whisper；缺失时准确返回受限状态，不会用标题补写视频内容。</p></details></section>
+<section><h2>连接与功能授权</h2><p>回到 Tulpa 的「连接外部 Agent」页面，在同一份连接中勾选 B站只读、可选的 QQ 原生分享和需要的其他能力。此页只管理账号登录，不创建额外 MCP，也不重复选择群或审批分享。</p><a href="/?connect=mcp">返回统一授权页</a></section>
+</main></body></html>

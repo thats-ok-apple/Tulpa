@@ -526,19 +526,21 @@ window.addEventListener('pagehide',() => {
     body:JSON.stringify({data:[null],fn_index:state.functions.stop_agent,session_hash:state.hash})});
 });
 
+let initAttempts=0,initRetryTimer=null;
 async function init() {
+  clearTimeout(initRetryTimer);
   let showReasoning=true;try{showReasoning=localStorage.getItem('tulpa.showReasoning')!=='false';}catch{}
   setShowReasoning(showReasoning,false);
   void loadReasoningPreference();
   try { $('load-stickers').checked=localStorage.getItem('chatlocal.loadStickers.v2')==='true'; } catch {}
   sidebar(!mobile.matches); syncControls();
   try {
-    const response=await fetch(`${API}/config`); if (!response.ok) throw new Error('无法连接本机服务，请刷新页面。');
+    const response=await fetch(`${API}/config`,{cache:'no-store',signal:AbortSignal.timeout(15000)}); if (!response.ok) throw new Error('本机界面服务正在重连。');
     const config=await response.json(); state.functions=Object.fromEntries(config.dependencies.map(d=>[d.api_name,d.id]));
     await Promise.all([loadProfiles(),loadReadOptions(),loadVisionOptions()]);
     const sessions=await call('refresh_sessions',[]); savePicker(sessions[0]);
     const data=await call('refresh',[]); setData(data[0],data[1]);
-    state.ready=true; syncControls(); renderHistory();
+    state.ready=true;initAttempts=0;syncControls(); renderHistory();
     await loadWatches();
     let last,lastWatch,lastWorkspace; try { last=localStorage.getItem('chatlocal.lastConversation');lastWatch=localStorage.getItem('chatlocal.lastWatch');lastWorkspace=localStorage.getItem('chatlocal.workspace'); } catch {}
     if(lastWorkspace || new URLSearchParams(location.search).get('workspace')) {renderMessages();}
@@ -547,7 +549,13 @@ async function init() {
     else { renderMessages(); if (!mobile.matches) focusComposer(); }
     const anchor=Number(new URLSearchParams(location.search).get('anchor'));
     if (Number.isSafeInteger(anchor) && anchor>0) await openChat(anchor);
-  } catch (error) { toast(error.message); $('history-list').textContent='连接失败，请刷新页面重试。'; }
+  } catch (error) {
+    if(!state.ready){
+      const delay=Math.min(30000,1000*2**Math.min(initAttempts++,5));
+      $('history-list').textContent=`界面连接暂时中断，${Math.ceil(delay/1000)} 秒后自动重连；监听状态单独显示。`;
+      initRetryTimer=setTimeout(init,delay);
+    }else{renderHistory();toast('部分界面资料暂未加载，可继续使用；后台监听状态单独显示。');}
+  }
   finally { state.initialized=true;syncControls(); }
 }
 

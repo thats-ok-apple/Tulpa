@@ -1,4 +1,5 @@
 """Local OneBot transport. Credentials and mutation authority never enter tools."""
+from . import reply_timing as timing
 import json
 import os
 import threading
@@ -8,6 +9,7 @@ from urllib.parse import urlparse
 import httpx
 from dotenv import dotenv_values
 from .config import ROOT
+from .mcp_qq_catalog import READ_APIS, WRITE_APIS
 
 
 class OneBotError(ValueError):
@@ -24,8 +26,11 @@ class OneBotUncertain(OneBotError):
 READS = frozenset(('get_login_info', 'get_version_info', 'get_group_info', 'get_group_list',
     'get_group_member_info', 'get_group_member_list', 'get_group_system_msg',
     '_get_group_notice', 'get_essence_msg_list', 'get_group_file_system_info',
-    'get_group_root_files', 'get_group_files_by_folder', 'get_group_file_url', 'get_image', 'fetch_custom_face_detail'))
+    'get_group_root_files', 'get_group_files_by_folder', 'get_group_file_url', 'get_image', 'fetch_custom_face_detail',
+    'get_msg', 'get_forward_msg', 'get_friend_list'))
 WRITES = frozenset(('set_group_ban', 'set_group_kick', 'set_group_name', 'set_group_add_request', 'add_custom_face', 'set_msg_emoji_like'))
+READS = READS | frozenset(READ_APIS)
+WRITES = WRITES | frozenset(WRITE_APIS)
 
 
 def configuration(root=None):
@@ -43,7 +48,7 @@ def configuration(root=None):
 
 
 class Client:
-    def __init__(self, config=None, transport=None, timeout=12):
+    def __init__(self, config=None, transport=None, timeout=12, deadline=None):
         config = configuration() if config is None else config
         self.managed_config = config
         self.url = config.get('url', '').rstrip('/')
@@ -53,8 +58,9 @@ class Client:
                 parsed.hostname not in ('127.0.0.1', 'localhost', '::1') or
                 parsed.username or parsed.password or parsed.query or parsed.fragment):
             raise OneBotError('请先配置有效的本机 OneBot HTTP 地址和 Token。')
-        self.transport, self.timeout = transport, timeout
+        self.transport, self.timeout, self.deadline = transport, timeout, deadline
 
+    @timing.stage("onebot.query")
     def call(self, action, payload, *, approved=False):
         from .snowluma_managed import guard
         try:
@@ -63,15 +69,23 @@ class Client:
             raise OneBotError('QQ 托管授权、进程或账号绑定已失效，未执行操作。', 'managed_not_ready') from None
         if action not in (READS | (WRITES if approved else frozenset())):
             raise OneBotError('该接口不在允许范围内，管理操作需要审批。')
+        timing.note(onebot_action=action)
         writing = action in WRITES
         try:
-            with httpx.Client(timeout=httpx.Timeout(self.timeout, connect=3),
+            remaining=self.deadline-time.monotonic() if self.deadline is not None else self.timeout
+            if remaining<=0:raise OneBotError('本批消息补取预算已用完。','query_budget_exhausted')
+            timeout=min(self.timeout,remaining)
+            with httpx.Client(timeout=httpx.Timeout(timeout, connect=min(3,timeout)),
                               transport=self.transport, trust_env=False, follow_redirects=False) as client:
+                if self.deadline is not None and time.monotonic()>=self.deadline:
+                    raise OneBotError('本批消息补取预算已用完。','query_budget_exhausted')
                 with client.stream('POST', self.url + '/' + action, json=payload,
                                    headers={'Authorization': 'Bearer ' + self.token} if self.token else {}) as response:
                     response.raise_for_status()
                     raw = bytearray()
                     for chunk in response.iter_bytes():
+                        if self.deadline is not None and time.monotonic()>=self.deadline:
+                            raise OneBotError('本批消息补取预算已用完。','query_budget_exhausted')
                         raw.extend(chunk)
                         if len(raw) > 8 * 1024 * 1024:
                             raise ValueError('oversize')

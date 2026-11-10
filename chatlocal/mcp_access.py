@@ -9,12 +9,52 @@ from contextlib import contextmanager
 
 from .client_accounts import bound_account
 from .retrieval import Plan, date_bound
+from .mcp_qq_permissions import QQ_FLAGS, MEDIA_FLAGS as ATTACHMENT_FLAGS, live_grant
 
 CHAT_MEDIA_FLAGS = ('chat_images', 'chat_sticker_send', 'chat_sticker_collect')
 CHAT_EXTRA_FLAGS = ('chat_reactions',)
-CHAT_MEDIA_TOOLS = ('read_chat_image','list_chat_stickers','read_chat_sticker','note_chat_sticker','send_chat_sticker','collect_chat_sticker')
+PERMISSION_FLAGS = ('media', 'prepare', 'voice', 'onebot', 'send', 'manage', 'chat', 'bilibili_read', 'bilibili_share',
+                    *CHAT_MEDIA_FLAGS, *CHAT_EXTRA_FLAGS, *QQ_FLAGS)
+CHAT_MEDIA_TOOLS = ('read_chat_image','import_chat_image','list_chat_stickers','read_chat_sticker','note_chat_sticker','send_chat_sticker','collect_chat_sticker')
+
+
+def history_platforms(scope):
+    # Old grants retain exactly their old history access. New grants opt in
+    # separately; live QQ membership must not implicitly authorize a database.
+    return scope.get('history_platforms', scope['platforms'])
 
 DEFAULT_PORT = 18777
+
+
+def connection_body(body):
+    """The three UI modules are authoritative, including stale hidden fields.
+
+    Older clients omit modules and retain their existing contract.
+    """
+    if not isinstance(body, dict):raise ValueError('连接配置字段无效。')
+    result = dict(body)
+    modules = result.pop('modules', None)
+    if modules is None:return result
+    if (not isinstance(modules, dict) or set(modules) != {'qq','wechat','bilibili'} or
+            any(type(v) is not bool for v in modules.values())):
+        raise ValueError('请选择有效的授权模块。')
+    for field in ('platforms','history_platforms'):
+        value = result.get(field, [])
+        if not isinstance(value,list) or any(p not in ('qq','wechat') for p in value):
+            raise ValueError('平台范围无效。')
+        result[field] = [p for p in value if modules[p]]
+    pairs = result.get('conversations', [])
+    if not isinstance(pairs,list) or any(not isinstance(p,list) or len(p)!=2 or p[0] not in ('qq','wechat') for p in pairs):
+        raise ValueError('会话范围无效。')
+    result['conversations'] = [p for p in pairs if modules[p[0]]]
+    if not modules['qq']:
+        for flag in ('onebot','send','manage','chat',*CHAT_MEDIA_FLAGS,*CHAT_EXTRA_FLAGS,*QQ_FLAGS):
+            result[flag] = False
+    if not modules['bilibili']:result['bilibili_read'] = result['bilibili_share'] = False
+    if not modules['qq']:result['bilibili_share'] = False
+    if not result['history_platforms']:
+        for flag in ('media','prepare','voice','onebot'):result[flag] = False
+    return result
 
 
 class AccessDenied(ValueError):
@@ -22,6 +62,10 @@ class AccessDenied(ValueError):
 
 
 class RateLimited(ValueError):
+    pass
+
+
+class GrantConflict(ValueError):
     pass
 
 
@@ -44,6 +88,10 @@ class MCPAccess:
                     messages INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS calls_budget ON calls(grant_id,tool,at);
             ''')
+            if 'revision' not in {r[1] for r in db.execute('PRAGMA table_info(grants)')}:
+                db.execute('ALTER TABLE grants ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+            if 'paused' not in {r[1] for r in db.execute('PRAGMA table_info(grants)')}:
+                db.execute('ALTER TABLE grants ADD COLUMN paused INTEGER NOT NULL DEFAULT 0')
 
     @contextmanager
     def connect(self):
@@ -64,6 +112,8 @@ class MCPAccess:
     def configure(self, enabled, port):
         if type(enabled) is not bool or type(port) is not int or not 1024 <= port <= 65535:
             raise ValueError('启用状态或端口无效；端口范围 1024–65535。')
+        from .terminal_instances import validate_mcp_port
+        validate_mcp_port(self.store.path.parent.parent, port)
         with self.connect() as db:
             db.execute('UPDATE settings SET enabled=?,port=? WHERE id=1', (enabled, port))
 
@@ -75,26 +125,43 @@ class MCPAccess:
         return {p: bound_account(self.store, p) or '' for p in platforms}
 
     def create(self, body):
-        fields = {'name', 'platforms', 'conversations', 'all_conversations', 'allow_future_imports', 'start', 'end', 'media', 'prepare', 'voice', 'onebot', 'send', 'manage', 'chat', *CHAT_MEDIA_FLAGS, *CHAT_EXTRA_FLAGS}
+        body = connection_body(body)
+        fields = {'name', 'platforms', 'history_platforms', 'conversations', 'all_conversations', 'start', 'end', *PERMISSION_FLAGS}
         if not isinstance(body, dict) or set(body) - fields:
             raise ValueError('连接配置字段无效。')
         name = body.get('name', '')
-        if not isinstance(name, str) or not name.strip() or len(name) > 60 or any(ord(c) < 32 for c in name):
-            raise ValueError('请填写不超过 60 字的连接名称。')
+        if not isinstance(name, str) or len(name) > 60 or any(ord(c) < 32 for c in name):
+            raise ValueError('连接名称不能超过 60 字。')
+        name = name.strip() or 'mcp-' + uuid.uuid4().hex[:12]
         platforms = body.get('platforms')
-        if not isinstance(platforms, list) or not platforms or any(p not in ('qq', 'wechat') for p in platforms):
+        if not isinstance(platforms, list) or (not platforms and body.get('bilibili_read') is not True) or any(p not in ('qq', 'wechat') for p in platforms):
             raise ValueError('请选择允许访问的平台。')
+        historical = body.get('history_platforms', platforms)
+        if (not isinstance(historical,list) or any(p not in platforms for p in historical) or
+                any(p not in ('qq','wechat') for p in historical)):
+            raise ValueError('历史数据读取范围必须属于所选平台。')
+        if not historical and not live_grant(body) and not body.get('bilibili_read'):
+            raise ValueError('请至少选择历史数据读取、实时 QQ 或 B站只读功能。')
+        if not historical and any(body.get(k) for k in ('media','prepare','voice')):
+            raise ValueError('历史图片、文件和语音读取需要先授权历史数据平台。')
         conversations = body.get('conversations', [])
+        if not isinstance(conversations,list) or len(conversations)>500:
+            raise ValueError('请选择最多 500 个会话。')
         # Live chat can be authorized before importing any native chat history.
         chat_account = None
         live_groups = set()
-        if body.get('chat') is True and body.get('send') is True and 'qq' in platforms:
+        if live_grant(body) and 'qq' in platforms:
             from .onebot import Client
             client = Client(timeout=3)
             chat_account = client.login()
             if not body.get('all_conversations'):
                 live_groups = {f'{chat_account}:group:{g["group_id"]}' for g in client.call('get_group_list', {})
                                if isinstance(g,dict) and str(g.get('group_id','')).isdigit()}
+                # Only fetch the friend directory when direct conversations are
+                # selected; legacy group grants need no new upstream endpoint.
+                if any(isinstance(p,list) and len(p)==2 and isinstance(p[1],str) and ':direct:' in p[1] for p in conversations):
+                    live_groups.update(f'{chat_account}:direct:{f["user_id"]}' for f in client.call('get_friend_list', {})
+                                       if isinstance(f,dict) and str(f.get('user_id','')).isdigit())
         if not isinstance(conversations, list) or len(conversations) > 500:
             raise ValueError('请选择最多 500 个会话。')
         selections = []
@@ -107,12 +174,12 @@ class MCPAccess:
             selection = json.dumps(pair, ensure_ascii=False)
             if selection not in selections:
                 selections.append(selection)
-        for flag in ('all_conversations', 'allow_future_imports', 'media', 'prepare', 'voice', 'onebot', 'send', 'manage', 'chat', *CHAT_MEDIA_FLAGS, *CHAT_EXTRA_FLAGS):
+        for flag in ('all_conversations', *PERMISSION_FLAGS):
             if flag in body and type(body[flag]) is not bool:
                 raise ValueError('权限开关必须为布尔值。')
         if body.get('all_conversations'):
             selections = []
-        elif not selections:
+        elif platforms and not selections:
             raise ValueError('请选择会话，或明确允许所选平台的全部会话。')
         dates = {}
         for key in ('start', 'end'):
@@ -131,31 +198,85 @@ class MCPAccess:
         if start is not None and end is not None and start >= end:
             raise ValueError('开始日期不能晚于截止日期。')
         scope = dict(platforms=sorted(set(platforms)), conversations=selections, **dates,
-                     **{k: body.get(k, False) for k in ('media', 'prepare', 'voice', 'onebot', 'send', 'manage', 'chat', *CHAT_MEDIA_FLAGS, *CHAT_EXTRA_FLAGS)})
-        if (scope['send'] or scope['manage']) and 'qq' not in platforms:
-            raise ValueError('发送和群管理需要选择 QQ 平台。')
-        if scope['chat'] and not scope['send']:
-            raise ValueError('持续聊天需要同时允许直接发送 QQ 消息。')
-        if scope['chat_reactions'] and not scope['chat']:
-            raise ValueError('消息表情回应需要开启持续群聊及发送权限。')
-        if any(scope[k] for k in CHAT_MEDIA_FLAGS) and not scope['chat']:
-            raise ValueError('表情包子功能需要开启持续群聊。')
-        if (scope['chat_sticker_send'] or scope['chat_sticker_collect']) and not scope['chat_images']:
-            raise ValueError('发送和收藏表情需要先允许持续聊天看图。')
-        accounts = self.accounts(platforms)
-        if body.get('allow_future_imports'):
-            if not body.get('all_conversations') or scope['send'] or scope['manage'] or scope['chat'] or scope['onebot']:
-                raise ValueError('预先连接仅支持明确授权全部会话的只读资料访问。')
-            with self.store.connect() as db:
-                scope['pending_platforms'] = [p for p in platforms if not accounts[p] and
-                    not db.execute('SELECT 1 FROM messages WHERE platform=? LIMIT 1', (p,)).fetchone()]
+                     **{k: body.get(k, False) for k in PERMISSION_FLAGS})
+        if 'history_platforms' in body:
+            scope['history_platforms'] = sorted(set(historical))
+        self.validate_permissions(scope)
         if chat_account:scope['chat_account'] = chat_account
         token = secrets.token_urlsafe(32)
         gid = uuid.uuid4().hex
         with self.connect() as db:
             db.execute('INSERT INTO grants(id,name,token_hash,scope,epoch,accounts,created_at) VALUES(?,?,?,?,?,?,?)',
-                       (gid, name.strip(), self.digest(token), json.dumps(scope), self.epoch(), json.dumps(accounts), time.time()))
-        return dict(id=gid, token=token)
+                       (gid, name.strip(), self.digest(token), json.dumps(scope), self.epoch(), json.dumps(self.accounts(historical)), time.time()))
+        return dict(id=gid, name=name, token=token)
+
+    @staticmethod
+    def validate_permissions(scope):
+        if scope.get('bilibili_share') and (not scope.get('bilibili_read') or 'qq' not in scope['platforms']):
+            raise ValueError('B站原生分享需要 B站只读权限和 QQ 群范围。')
+        if not history_platforms(scope) and any(scope.get(k) for k in ('media','prepare','voice','onebot')):
+            raise ValueError('历史附件及历史群资料工具需要先授权历史数据平台。实时水群使用独立的实时权限。')
+        if any(scope.get(k) for k in QQ_FLAGS) and 'qq' not in scope['platforms']:
+            raise ValueError('SL 扩展权限需要选择 QQ 平台。')
+        if any(scope.get(k) for k in ATTACHMENT_FLAGS) and not scope.get('chat'):
+            raise ValueError('实时附件权限需要开启持续聊天及发送权限。')
+        if (scope.get('send') or scope.get('manage')) and 'qq' not in scope['platforms']:
+            raise ValueError('发送和群管理需要选择 QQ 平台。')
+        if scope.get('chat') and not scope.get('send'):
+            raise ValueError('持续聊天需要同时允许直接发送 QQ 消息。')
+        if scope.get('chat_reactions') and not scope.get('chat'):
+            raise ValueError('消息表情回应需要开启持续群聊及发送权限。')
+        if any(scope.get(k) for k in CHAT_MEDIA_FLAGS) and not scope.get('chat'):
+            raise ValueError('表情包子功能需要开启持续群聊。')
+        if (scope.get('chat_sticker_send') or scope.get('chat_sticker_collect')) and not scope.get('chat_images'):
+            raise ValueError('发送和收藏表情需要先允许持续聊天看图。')
+
+    def update_permissions(self, gid, body):
+        """Operator-only partial update. Keep the credential, source binding and scope bounds."""
+        if not isinstance(body, dict) or set(body)-{*PERMISSION_FLAGS, 'expected_revision'}:
+            raise ValueError('只可修改权限开关；连接名称、账号、会话范围和日期保持不变。')
+        changes = {k:v for k,v in body.items() if k in PERMISSION_FLAGS}
+        if any(type(v) is not bool for v in changes.values()):
+            raise ValueError('权限开关必须为布尔值。')
+        expected = body.get('expected_revision')
+        if 'expected_revision' in body and (type(expected) is not int or expected < 0):
+            raise ValueError('权限版本必须为非负整数。')
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM grants WHERE id=? AND revoked=0', (gid,)).fetchone()
+        if not row:raise AccessDenied('连接不存在或已撤销，不能修改权限。')
+        if expected is not None and expected != row['revision']:
+            raise GrantConflict('权限已被其他操作修改，请刷新列表后重新编辑。')
+        old = json.loads(row['scope']);scope = old | changes
+        self.validate_permissions(scope)
+        changed = any(bool(old.get(k)) != v for k,v in changes.items())
+        if not changed:return dict(id=gid,scope=old,revision=row['revision'],changed=False)
+        enabled = {k for k,v in changes.items() if v and not old.get(k)}
+        # A reduction must work even when SL is offline. Enabling live QQ
+        # capabilities verifies the existing account and never rebinds a token.
+        live_flags = {'onebot','send','manage','chat','bilibili_share',*CHAT_MEDIA_FLAGS,*CHAT_EXTRA_FLAGS,*QQ_FLAGS}
+        if enabled & live_flags and 'qq' in scope['platforms']:
+            from .onebot import Client
+            actual = Client(timeout=3).login()
+            bound = old.get('chat_account') or json.loads(row['accounts']).get('qq')
+            if bound and actual != bound:
+                raise AccessDenied('SL 登录账号与此连接原绑定账号不一致，未修改权限。')
+            for selection in scope['conversations']:
+                platform,cid = json.loads(selection)
+                if platform=='qq' and (':group:' in cid or ':direct:' in cid):
+                    if cid.split(':')[0] != actual:
+                        raise AccessDenied('会话所属账号与当前 SL 不一致，未修改权限。')
+            scope['chat_account'] = actual
+        with self.connect() as db:
+            updated = db.execute('UPDATE grants SET scope=?,revision=revision+1 WHERE id=? AND revoked=0 AND revision=?',
+                                 (json.dumps(scope),gid,row['revision'])).rowcount
+            if not updated:raise GrantConflict('权限或撤销状态已变化，请刷新列表后重新编辑。')
+        return dict(id=gid,scope=scope,revision=row['revision']+1,changed=True)
+
+    def ensure_revision(self, grant):
+        current = self.by_id(grant['id'], source=False)
+        if current.get('revision',0) != grant.get('revision',0):
+            raise AccessDenied('连接权限已修改，请刷新工具列表并重新开始本次操作。')
+        return current
 
     @staticmethod
     def digest(token):
@@ -181,33 +302,13 @@ class MCPAccess:
 
     def validate_grant(self, row, *, source=True):
         grant = dict(row)
+        if grant.get('paused'):raise AccessDenied('此 MCP 连接已关闭，请在 Tulpa 中重新开启。')
         grant['scope'] = json.loads(grant['scope'])
         if not source:return grant  # Authentication only. Tool-specific checks still apply.
-        if grant['scope'].get('pending_platforms'):
-            # Explicit read-only preauthorization pins each initially empty
-            # platform once. Later native account changes still invalidate it.
-            with self.connect() as db:
-                db.execute('BEGIN IMMEDIATE')
-                current = db.execute('SELECT * FROM grants WHERE id=? AND revoked=0', (grant['id'],)).fetchone()
-                if not current or current['epoch'] != self.epoch():
-                    raise AccessDenied('数据来源或账号已改变，请在 Tulpa 重新授权。')
-                scope = json.loads(current['scope']);accounts = json.loads(current['accounts'])
-                actual = self.accounts(scope['platforms'])
-                pending = scope.get('pending_platforms', [])
-                if any(actual[p] != accounts[p] for p in scope['platforms'] if p not in pending):
-                    raise AccessDenied('数据来源或账号已改变，请在 Tulpa 重新授权。')
-                remaining = []
-                with self.store.connect() as source_db:
-                    for p in pending:
-                        if actual[p] or source_db.execute('SELECT 1 FROM messages WHERE platform=? LIMIT 1', (p,)).fetchone():
-                            accounts[p] = actual[p]
-                        else:remaining.append(p)
-                scope['pending_platforms'] = remaining
-                db.execute('UPDATE grants SET scope=?,accounts=? WHERE id=?',
-                    (json.dumps(scope), json.dumps(accounts), grant['id']))
-                grant = dict(current);grant['scope'] = scope;grant['accounts'] = json.dumps(accounts)
+        historical = history_platforms(grant['scope'])
+        if not historical:return grant  # Live-only connection has no imported source binding.
         try:
-            valid = grant['epoch'] == self.epoch() and json.loads(grant['accounts']) == self.accounts(grant['scope']['platforms'])
+            valid = grant['epoch'] == self.epoch() and json.loads(grant['accounts']) == self.accounts(historical)
         except ValueError:
             valid = False
         if not valid:
@@ -218,17 +319,32 @@ class MCPAccess:
         with self.connect() as db:
             db.execute('UPDATE grants SET revoked=1 WHERE id=?', (gid,))
 
+    def set_enabled(self, gid, enabled):
+        if type(enabled) is not bool:raise ValueError('连接开关无效。')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT paused,revoked FROM grants WHERE id=?',(gid,)).fetchone()
+            if not row or row['revoked']:raise AccessDenied('连接已删除或撤销，请重新创建。')
+            changed = bool(row['paused']) == enabled
+            if changed:
+                db.execute('UPDATE grants SET paused=?,revision=revision+1 WHERE id=?',(int(not enabled),gid))
+        return dict(id=gid,enabled=enabled,changed=changed)
+
+    def delete(self, gid):
+        # Keep independent learning libraries and operation receipts. The token
+        # hash and connection scope are removed, so this connection cannot resume.
+        with self.connect() as db:
+            db.execute('DELETE FROM calls WHERE grant_id=?',(gid,))
+            db.execute('DELETE FROM grants WHERE id=?',(gid,))
+        return dict(id=gid,deleted=True)
+
     def list(self):
         with self.connect() as db:
-            rows = [dict(r) for r in db.execute('SELECT id,name,scope,accounts,epoch,created_at,revoked FROM grants ORDER BY created_at DESC')]
+            rows = [dict(r) for r in db.execute('SELECT id,name,scope,accounts,epoch,created_at,revoked,revision,paused FROM grants ORDER BY created_at DESC')]
             for row in rows:
                 row['scope'] = json.loads(row['scope'])
                 row['accounts'] = json.loads(row['accounts'])
-                try:
-                    actual = self.accounts(row['scope']['platforms'])
-                    pending = row['scope'].get('pending_platforms', [])
-                    row['valid'] = not row['revoked'] and row.pop('epoch') == self.epoch() and all(
-                        p in pending or row['accounts'][p] == actual[p] for p in row['scope']['platforms'])
+                try:row['valid']=not row['revoked'] and (not history_platforms(row['scope']) or row.pop('epoch')==self.epoch() and row['accounts']==self.accounts(history_platforms(row['scope'])))
                 except ValueError:row['valid']=False
                 row.pop('epoch',None)
                 row['calls'] = db.execute('SELECT count(*) FROM calls WHERE grant_id=?', (row['id'],)).fetchone()[0]
@@ -240,7 +356,8 @@ class MCPAccess:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             limit = {'prepare_file': 12, 'download_file': 12, 'transcribe_voice': 12, 'read_image': 60,
-                     'read_chat_image':60,'read_chat_sticker':60,'collect_chat_sticker':12}.get(tool)
+                     'import_qq_media':30,'read_chat_attachment':60,
+                     'read_chat_image':60,'read_chat_sticker':60,'import_chat_image':60,'collect_chat_sticker':12}.get(tool)
             group = ('prepare_file','download_file') if tool in ('prepare_file','download_file') else ('read_chat_image','read_chat_sticker') if tool in ('read_chat_image','read_chat_sticker') else (tool,)
             if limit and db.execute('SELECT count(*) FROM calls WHERE grant_id=? AND tool IN ('+','.join('?' for _ in group)+') AND at>?',
                                     (gid, *group, time.time()-3600)).fetchone()[0] >= limit:
@@ -260,7 +377,10 @@ class MCPAccess:
             db.execute('UPDATE calls SET status=?,seconds=?,messages=? WHERE id=?', (status, round(seconds, 3), messages, call_id))
 
     @staticmethod
-    def plan(grant):
+    def plan(grant, *, history=False):
         scope = grant['scope']
-        return Plan(platforms=scope['platforms'], conversations=scope['conversations'],
+        platforms = history_platforms(scope) if history else scope['platforms']
+        if history and not platforms:
+            raise AccessDenied('此连接未授权历史聊天数据读取。')
+        return Plan(platforms=platforms, conversations=scope['conversations'],
                     start=date_bound(scope['start']), end=date_bound(scope['end'], True))

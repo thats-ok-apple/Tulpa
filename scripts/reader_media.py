@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 from PIL import Image
 
 from chatlocal.config import DATA, ROOT
-from chatlocal.media import cache_image,unavailable,omitted_sticker,MAX_MEDIA_BYTES
+from chatlocal.media import cache_image,unavailable,omitted_sticker,MAX_MEDIA_BYTES,UnsupportedMedia
 
 
 def xml_message(content):
@@ -24,12 +24,14 @@ def xml_message(content):
 
 
 class QQMedia:
-    def __init__(self,q,source,load_stickers=True):
+    def __init__(self,q,source,load_stickers=True,*,read_images=True,scan=True,image_writer=None):
         self.q=q
+        self.read_images=read_images
+        self.image_writer=image_writer
         self.load_stickers=load_stickers
         self.index=collections.defaultdict(list)
         self.root=root=Path(source).parent/'nt_data'
-        for folder in (('Pic','Emoji') if load_stickers else ('Pic',)):
+        for folder in ((('Pic','Emoji') if load_stickers else ('Pic',)) if read_images and scan else ()):
             for path in (root/folder).rglob('*'):
                 if path.is_file():
                     for key in {path.name.lower(),path.stem.lower(),path.stem.lower().split('_')[0]}:
@@ -55,9 +57,12 @@ class QQMedia:
         key=(md5,filename,kind)
         if not self.load_stickers and (kind in ('sticker','gif') or filename.lower().endswith('.gif')):
             return omitted_sticker(kind,md5=md5,filename=filename)
+        if not self.read_images:return unavailable(kind,reason_code='read_disabled',md5=md5,filename=filename)
         cached=self.cache.get(key)
-        if cached and cached['status']!='unavailable':return cached
-        item=unavailable(kind,md5=md5,filename=filename)
+        if cached and cached['status']!='unavailable':
+            from chatlocal.media import media_path
+            if cached['status']=='omitted' or media_path(cached) is not None:return cached
+        item=unavailable(kind,reason_code='source_missing' if md5 or filename else 'metadata_missing',md5=md5,filename=filename)
         candidates=[]
         for path in self.current_paths(md5,filename,timestamp):
             try:
@@ -67,10 +72,15 @@ class QQMedia:
         candidates.sort(key=lambda pair:('Ori' not in pair[0].parts,'Thumb' in pair[0].parts,-pair[1]))
         for path,_ in candidates:
             try:
-                item=cache_image(path.read_bytes(),kind,load_stickers=self.load_stickers,md5=md5,filename=filename,
+                item=(self.image_writer or cache_image)(path.read_bytes(),kind,load_stickers=self.load_stickers,md5=md5,filename=filename,
                     thumbnail='Thumb' in path.parts,recovered_by='chatlog-keeper protobuf + NTQQ local cache')
                 break
-            except (OSError,ValueError,Image.DecompressionBombError):continue
+            except UnsupportedMedia:
+                item=unavailable(kind,reason_code='format_unsupported',md5=md5,filename=filename)
+                continue
+            except (OSError,ValueError,Image.DecompressionBombError):
+                item=unavailable(kind,reason_code='cache_corrupt',md5=md5,filename=filename)
+                continue
         self.cache[key]=item
         return item
 
@@ -97,7 +107,12 @@ class QQMedia:
             if not md5:md5=text(self.q._NTQQ_MSG_FACE_HASH)
             if not quoted and (width and height or filename.lower().endswith(('.jpg','.jpeg','.png','.gif','.webp')) or face):
                 kind='sticker' if subtype==4096 or face else 'image'
-                images.append(self.resolve(kind,md5,filename,timestamp))
+                item=self.resolve(kind,md5,filename,timestamp)
+                if kind=='image':
+                    from chatlocal.qq_image_refs import from_fields
+                    urls=from_fields(fields)
+                    if urls:item=dict(item,metadata=dict(item.get('metadata',{}),remote_urls=urls))
+                images.append(item)
             for typ,body in fields.get(self.q._NTQQ_MSG_TEXT_PRIMARY,[]):
                 if typ=='bytes' and isinstance(body,bytes):
                     (quoted_texts if quoted else texts).append(body.decode('utf-8','replace'))
@@ -114,7 +129,10 @@ class QQMedia:
         if reply and len(reply_identity)==3:reply['_native_quote']=reply_identity
         # Mixed messages can repeat the same element wrapper; retain distinct images.
         unique={json.dumps(x,sort_keys=True):x for x in images}
-        return ' '.join(texts),list(unique.values())[:16],reply
+        text=' '.join(texts)
+        if texts and any(texts) and not text.strip() and not unique and not reply:
+            text='[空白文本]'
+        return text,list(unique.values())[:16],reply
 
 
 def resolve_qq_quote(db,spec,peer,reply):
@@ -136,8 +154,9 @@ def resolve_qq_quote(db,spec,peer,reply):
 
 
 class WeChatMedia:
-    def __init__(self,reader,metadata,load_stickers=True,*,live=False,read_images=True):
+    def __init__(self,reader,metadata,load_stickers=True,*,live=False,read_images=True,image_writer=None):
         self.load_stickers=load_stickers
+        self.image_writer=image_writer
         self.live=live
         self.read_images=read_images
         self.root=Path(metadata['source_db']).parent
@@ -148,6 +167,8 @@ class WeChatMedia:
         # Keep message metadata/quote parsing available without initializing a
         # downloader, probing keys or touching any attachment filesystem.
         if not read_images:return
+        self.account=reader.account
+        self.wxid=reader.wxid
         from wechatauto.media import MediaDownloader
         root=self.root
         proxy=SimpleNamespace(account_dir=str(root),account=reader.account,wxid=reader.wxid,
@@ -181,6 +202,43 @@ class WeChatMedia:
             if not self.decoder._probe_ct(str(path)):return None
             return key if self.decoder._validate_key(key) else None
         except (OSError,ValueError,TypeError,AttributeError):return None
+
+    def macos_image_key(self, path):
+        """Derive an account-bound V2 key from local kvcomm filenames.
+
+        Never inspect process memory or cache contents. Verify each candidate
+        against this image before using it; filenames may belong to other accounts.
+        """
+        if sys.platform != 'darwin':
+            return None
+        match = re.fullmatch(r'(wxid_[A-Za-z0-9]+)_([0-9a-fA-F]{4})', self.root.name)
+        if not match:
+            return None
+        wxid, suffix = match.groups()
+        if self.account != self.root.name or self.wxid not in (wxid, self.root.name):
+            return None
+        kvcomm = self.root.parent.parent/'app_data/net/kvcomm'
+        try:
+            names = [p.name for p in kvcomm.iterdir() if p.is_file()]
+        except OSError:
+            return None
+        candidates = set()
+        for name in names:
+            found = re.fullmatch(r'key_([0-9]{1,10})_.*\.statistic', name)
+            if not found:
+                continue
+            uin = int(found.group(1))
+            if 0 < uin <= 0xffffffff and hashlib.md5(str(uin).encode()).hexdigest()[:4] == suffix.lower():
+                candidates.add(uin)
+        for uin in candidates:
+            key = hashlib.md5((str(uin)+wxid).encode()).hexdigest()[:16]
+            try:
+                self.decoder._key_probe = None
+                if self.decoder._probe_ct(str(path)) and self.decoder._validate_key(key):
+                    return key, uin & 255
+            except (OSError, ValueError, TypeError):
+                continue
+        return None
 
     def advance_index(self):
         """Incremental fallback for unusual layouts; never block a poll on a walk."""
@@ -240,12 +298,12 @@ class WeChatMedia:
         element=xml.find('.//emoji' if kind==47 else './/img') if xml is not None else None
         if not md5 and element is not None:md5=element.get('md5')
         if not getattr(self,'read_images',True):
-            return '',[unavailable(media_kind,reason='图片读取已关闭',md5=md5)],None
+            return '',[unavailable(media_kind,reason_code='read_disabled',md5=md5)],None
         key=(md5,media_kind)
         # Only successful/explicitly omitted media is cached. Missing or partially
         # written attachments can become readable after the message is committed.
         if key not in self.cache or self.cache[key]['status']=='unavailable':
-            item=unavailable(media_kind,md5=md5)
+            item=unavailable(media_kind,reason_code='source_missing' if md5 else 'metadata_missing',md5=md5)
             paths=[]
             for path in self.current_paths(message,md5):
                 try:
@@ -258,21 +316,36 @@ class WeChatMedia:
                     if path.stat().st_size>MAX_MEDIA_BYTES:continue
                     data=path.read_bytes()
                     if path.suffix.lower()=='.dat':
+                        is_v2=data[:6]==b'\x07\x08V2\x08\x07'
                         if self.live:
-                            self.key=self.live_image_key(path) if data[:6]==b'\x07\x08V2\x08\x07' else None
+                            self.key=self.live_image_key(path) if is_v2 else None
                             self.xor=self.decoder._derive_xor_key(str(path))
-                        if data[:6]==b'\x07\x08V2\x08\x07' and not self.key:continue
+                        if is_v2:
+                            derived=self.macos_image_key(path)
+                            if derived:self.key,self.xor=derived
+                            if not self.key:
+                                item=unavailable(media_kind,reason_code='decrypt_failed',md5=md5)
+                                continue
                         data=self.decoder.decrypt_image(str(path),aes_key=self.key,xor_key=self.xor)
-                    if not data:continue
+                    if not data:
+                        item=unavailable(media_kind,reason_code='decrypt_failed',md5=md5)
+                        continue
                     original='wxgf' if data.startswith(b'wxgf') else None
                     if original:
                         # Upstream's WXGF/HEVC still-image conversion. Temporary
                         # files follow config's project-local TEMP/TMP settings.
                         data=self.decoder._wxgf_to_jpg(data)
-                    if not data:continue
-                    item=cache_image(data,media_kind,load_stickers=self.load_stickers,md5=md5,thumbnail=path.stem.endswith('_t'),
+                    if not data:
+                        item=unavailable(media_kind,reason_code='format_unsupported',md5=md5)
+                        continue
+                    item=(self.image_writer or cache_image)(data,media_kind,load_stickers=self.load_stickers,md5=md5,thumbnail=path.stem.endswith('_t'),
                         original_format=original,recovered_by='wechatauto-replica local media')
                     break
-                except (OSError,ValueError,RuntimeError,Image.DecompressionBombError):continue
+                except UnsupportedMedia:
+                    item=unavailable(media_kind,reason_code='format_unsupported',md5=md5)
+                    continue
+                except (OSError,ValueError,RuntimeError,Image.DecompressionBombError):
+                    item=unavailable(media_kind,reason_code='cache_corrupt',md5=md5)
+                    continue
             self.cache[key]=item
         return '',[self.cache[key]],None

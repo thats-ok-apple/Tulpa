@@ -1,0 +1,31 @@
+Tulpa 0.5.7 Linux MCP 终端源码包
+
+解压后进入 Tulpa 目录，准备 Python 3.13 或 uv，运行：
+
+    ./tulpa
+
+首次自动安装依赖、启动后台并打开终端界面，后续复用后台。
+如可执行权限丢失，先运行 chmod +x tulpa。首次安装需要联网。
+按 q 退出界面，后台继续运行；停止后台用 ./tulpa stop。
+只启动后台用 ./tulpa start；只安装依赖用 sh setup-linux.sh。
+
+SL Docker 托管：先安装并启动 Docker，再在「SL 托管」点击「启用 Docker 托管」，
+确认协议，等待启动后点击「扫码登录」。使用自己的 QQ 扫码；远程访问按弹窗转发端口。
+MCP、SL、Docker 托管和模型配置默认未启用，需要测试者自行设置与授权。
+仅接外部 Agent 的 MCP 无需给 Tulpa 配模型 API Key。
+
+多账号：主界面按 F2 打开「实例管理」，为每个 QQ 新建并启动独立实例，切换后分别
+配置 SL Docker 托管、扫码和 MCP 授权。管理端口、MCP 端口自动避让；SL 端口和数据卷
+各自隔离。退出 TUI 不停止后台；停止某个实例会停止其 SL。新实例不会复制已有配置。
+
+本包含默认人格和配置模板，不含账号、聊天记录、记忆、授权、Token、API Key、
+SL/VNC 密码、虚拟环境、缓存、模型、Docker 镜像或数据卷。
+首次启动会创建空数据库和本实例的管理凭据。
+0.5.7 验证范围：本机 WSL2 Ubuntu x86_64 启动与隔离回归，GitHub CI x86_64 / ARM64。
+未在本次发行验收中进行真实账号扫码、发言或模型学习质量测试。
+
+安装与使用：README.md、doc/LINUX_TERMINAL.md
+外部 Agent：doc/LINUX_AGENT_SETUP.md
+升级与打包：doc/LINUX_UPGRADE.md、doc/LINUX_CONTRIBUTING.md
+
+测试反馈请记录系统、架构、Python 版本、复现步骤和脱敏错误；无需分享账号凭证。

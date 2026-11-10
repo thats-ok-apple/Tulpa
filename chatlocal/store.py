@@ -50,6 +50,8 @@ class Store:
             columns={r[1] for r in db.execute('PRAGMA table_info(messages)')}
             if 'media_json' not in columns:db.execute("ALTER TABLE messages ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'")
             if 'reply_to' not in columns:db.execute('ALTER TABLE messages ADD COLUMN reply_to TEXT')
+            from .image_identity import initialize as initialize_image_ids
+            initialize_image_ids(db)
             from .reply_history import initialize as initialize_reply_history
             initialize_reply_history(db)
             if 'original_content' not in columns:db.execute('ALTER TABLE messages ADD COLUMN original_content TEXT')
@@ -59,6 +61,10 @@ class Store:
             initialize_scope(db)
             from .live_state import initialize as initialize_live
             initialize_live(db)
+            from .image_index import initialize as initialize_images
+            initialize_images(db)
+            from .image_remote import initialize as initialize_downloads
+            initialize_downloads(db)
             from .artifacts import initialize as initialize_artifacts
             initialize_artifacts(db)
             from .voice import initialize as initialize_voice
@@ -147,6 +153,8 @@ class Store:
             db.execute('INSERT OR IGNORE INTO sources VALUES(?,?,?,?,?,?,?)',
                        (digest, path.name, str(archive.relative_to(ROOT)), kind,
                        datetime.now(TZ).isoformat(), len(records), skipped))
+            if kind=='wechatauto' and isinstance(head.get('coverage'),dict):
+                db.execute("INSERT OR REPLACE INTO client_settings VALUES('wechat_coverage',?)",(json.dumps(head['coverage'],ensure_ascii=False),))
             next_id=max(db.execute('SELECT value FROM message_counter WHERE id=1').fetchone()[0],
                         db.execute('SELECT coalesce(max(id),0) FROM messages').fetchone()[0])
             for key, pointer, message in parsed:
@@ -178,11 +186,18 @@ class Store:
                     if (sync is not None or live is not None or discovery) and db.execute('SELECT 1 FROM deleted_message_keys WHERE dedup_key=?',(legacy_key,)).fetchone():
                         skipped+=1
                         continue
-                    if prior and old and prior['id']!=old['id']:raise ValueError('同一微信本地消息已有两个身份，请核对旧导入；本批未写入。')
+                    if prior and old and prior['id']!=old['id']:
+                        if live is not None:
+                            from .live_recovery import IdentityConflict
+                            raise IdentityConflict(message['conversation_id'])
+                        raise ValueError('同一微信本地消息已有两个身份，请核对旧导入；本批未写入。')
                     if prior and not old:
                         from .artifacts import is_file_ack
                         file_ack=is_file_ack(db,prior,message,files)
                         if not file_ack and (not prior['source_id'].startswith('local:') or not message['source_id'].isdigit() or int(message['source_id'])<=0):
+                            if live is not None:
+                                from .live_recovery import IdentityConflict
+                                raise IdentityConflict(message['conversation_id'])
                             raise ValueError('微信本地消息身份发生冲突；本批未写入。')
                         # Content/time validation below is in this transaction;
                         # a failed acknowledgement rolls the key update back.
@@ -220,6 +235,9 @@ class Store:
                     if old['timestamp']!=message['timestamp'] and acknowledged:
                         db.execute('UPDATE messages SET timestamp=? WHERE id=?',(message['timestamp'],old['id']))
                     elif old['timestamp']!=message['timestamp'] or old_source!=source_content:
+                        if live is not None and message['platform']=='wechat':
+                            from .live_recovery import IdentityConflict
+                            raise IdentityConflict(message['conversation_id'])
                         raise ValueError(f'{pointer}: 原始 ID 与已导入消息冲突；整份文件已回滚，请核对会话 ID。')
                     duplicate += 1
                     mid = old['id']
@@ -264,6 +282,10 @@ class Store:
                     db.execute('INSERT INTO message_fts(rowid,terms) VALUES(?,?)',
                                (mid, tokens(message['content'])))
                     added += 1
+                if media or old and old['media_json']!='[]':
+                    from .image_index import register as register_images
+                    current_media=json.loads(db.execute('SELECT media_json FROM messages WHERE id=?',(mid,)).fetchone()[0])
+                    register_images(db,mid,current_media,message['timestamp'])
                 db.execute('INSERT OR IGNORE INTO provenance VALUES(?,?,?)', (mid, digest, pointer))
                 if files:
                     from .artifacts import register_message
@@ -345,14 +367,27 @@ class Store:
     def latest_wechat_coverage(self):
         """Coverage of the latest successfully imported export, not a pending file."""
         with self.connect() as db:
-            rows=db.execute("SELECT archive FROM sources WHERE format='wechatauto' ORDER BY imported_at DESC").fetchall()
+            cached=db.execute("SELECT value FROM client_settings WHERE name='wechat_coverage'").fetchone()
+            if cached:
+                try:return json.loads(cached[0]) or None
+                except (ValueError,TypeError):pass
+            # Old realtime batches have no coverage. Never open thousands of
+            # message archives on every status refresh or UI initialization.
+            rows=db.execute("""SELECT archive FROM sources WHERE format='wechatauto'
+                AND filename NOT IN ('wechat.json','delta.json','batch.json')
+                ORDER BY CASE WHEN filename='wechat-real.json' THEN 0 ELSE 1 END,imported_at DESC LIMIT 16""").fetchall()
+        coverage=None
         for row in rows:
             try:
-                payload=json.loads(local_path(row['archive']).read_text(encoding='utf-8-sig'))
-                coverage=payload.get('coverage')
-                if isinstance(coverage,dict):return coverage
+                path=local_path(row['archive'])
+                if path.stat().st_size>16*1024*1024:continue
+                payload=json.loads(path.read_text(encoding='utf-8-sig'))
+                found=payload.get('coverage')
+                if isinstance(found,dict):coverage=found;break
             except (OSError,ValueError):continue
-        return None
+        with self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO client_settings VALUES('wechat_coverage',?)",(json.dumps(coverage or {},ensure_ascii=False),))
+        return coverage
 
     def latest_qq_coverage(self):
         """Settings of the last imported automatic QQ export, not a pending file."""

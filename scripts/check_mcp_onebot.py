@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 ROOT=Path(sys.argv[sys.argv.index('--package')+1]).resolve() if '--package' in sys.argv else Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from chatlocal.store import Store
@@ -57,7 +59,7 @@ async def read_notice(url,token):
 def main():
     server=ThreadingHTTPServer(('127.0.0.1',0),Fixture);threading.Thread(target=server.serve_forever,daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='mcp-onebot-') as tmp,patch.dict('os.environ',{},clear=True):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='mcp-onebot-') as tmp,patch.dict('os.environ',isolated_env(),clear=True):
             folder=Path(tmp);(folder/'.tmp').mkdir();store=Store(folder/'chats.sqlite3')
             imported=folder/'fixture.json';imported.write_text(json.dumps([dict(platform='qq',conversation_id='111:group:222',conversation='Fixture group',conversation_type='group',sender='Fixture',source_id='1',content='测试资料',timestamp='2026-10-01')]),'utf-8');store.import_file(imported)
             app=FastAPI();install_desktop_routes(app,folder);service=install_mcp_routes(app,store)

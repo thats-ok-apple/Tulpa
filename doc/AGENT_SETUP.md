@@ -1,5 +1,7 @@
 # 将 Tulpa 接入你的 Agent
 
+Linux CLI / TUI 的授权创建、连接配置与排错见 [Linux Agent 接入](LINUX_AGENT_SETUP.md)。以下保留桌面版的配置教程。
+
 适用于 Windows 上的 Tulpa 完整版和 MCP 轻量版。两版使用同一个 MCP 服务；只连接外部 Agent，不需要在 Tulpa 里填写模型 API Key。
 
 你可以自己按步骤配置，也可以把[文末指令](#交给-agent-配置)交给本机 Agent。本文示例只含占位值，不包含可直接使用的 Token。

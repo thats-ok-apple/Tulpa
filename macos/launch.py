@@ -30,7 +30,7 @@ def main():
     port = listener.getsockname()[1]
     application.state.tulpa_mcp.source_base = f'http://127.0.0.1:{port}'
     server = uvicorn.Server(uvicorn.Config(application, host='127.0.0.1', port=port,
-        access_log=False, log_level='warning', timeout_graceful_shutdown=5))
+        access_log=False, log_level='warning', lifespan='on', timeout_graceful_shutdown=5))
     worker = threading.Thread(target=server.run, kwargs={'sockets': [listener]}, daemon=True)
     worker.start()
     state = ROOT / '.tmp/macos-service.json'

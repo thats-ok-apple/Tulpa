@@ -147,6 +147,15 @@ def inspect_directory(path, limit=120):
 
 def windows_paths():
     home = Path.home()
+    if sys.platform.startswith('linux'):
+        from chatlog_keeper.core._linux import qq_data_roots
+        from chatlocal.native_sources import configured_root
+        roots=[dict(source='linux_xdg',path=str(p),stock=True) for p in qq_data_roots()]
+        configured=configured_root('qq')
+        if configured:roots.insert(0,dict(source='tulpa_configured',path=str(configured),stock=False))
+        override=os.environ.get('CHATLOG_QQ_DATA_ROOT','').strip()
+        if override:roots.insert(0,dict(source='environment_override',path=override,stock=False))
+        return dict(roots=roots,drives=[],override_set=bool(override))
     docs = []
     if os.name == 'nt':
         buffer = ctypes.create_unicode_buffer(32768)
@@ -179,6 +188,10 @@ def windows_paths():
 
 
 def qq_processes():
+    if sys.platform.startswith('linux'):
+        from chatlocal.platform_process import linux_processes
+        return dict(state='ok',processes=[dict(name='qq',exe=p['executable'],version=None,user_data=None)
+            for p in linux_processes() if Path(p['executable']).name.lower()=='qq'])
     if os.name != 'nt':return dict(state='unsupported_os', processes=[])
     command = r'''[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $ErrorActionPreference='Stop'

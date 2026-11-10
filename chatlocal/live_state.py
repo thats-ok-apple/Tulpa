@@ -22,6 +22,8 @@ def initialize(db):
         platform TEXT NOT NULL,conversation_id TEXT NOT NULL,locator TEXT NOT NULL,
         PRIMARY KEY(platform,conversation_id,locator));
     ''')
+    if 'last_success_at' not in {r[1] for r in db.execute('PRAGMA table_info(live_state)')}:
+        db.execute('ALTER TABLE live_state ADD COLUMN last_success_at REAL')
     for p in ('qq','wechat'): db.execute('INSERT OR IGNORE INTO live_state(platform) VALUES(?)',(p,))
 
 
@@ -29,10 +31,11 @@ def commit(db, transition, added, last_id):
     p=transition['platform']
     previous=json.loads(db.execute('SELECT checkpoint FROM live_state WHERE platform=?',(p,)).fetchone()[0])
     if previous!=transition['previous']: raise ValueError('实时进度已改变，本批未写入。')
-    db.execute('''UPDATE live_state SET checkpoint=?,last_commit=?,
+    now=time.time()
+    db.execute('''UPDATE live_state SET checkpoint=?,last_commit=?,last_success_at=CASE WHEN ? THEN ? ELSE last_success_at END,
         last_received=CASE WHEN ?>0 THEN ? ELSE last_received END,
         last_id=max(last_id,?),total_added=total_added+? WHERE platform=?''',
-        (json.dumps(transition['next']),time.time(),added,transition['observed_at'],last_id,added,p))
+        (json.dumps(transition['next']),now,transition.get('successful',True),now,added,transition['observed_at'],last_id,added,p))
 
 
 def record(db, mid, transition):

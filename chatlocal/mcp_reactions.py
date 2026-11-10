@@ -158,6 +158,7 @@ class ChatReactions:
         cfg=self.policy()
         if not cfg['enabled']:raise Rejected(cfg.get('error_code','feature_disabled'),'消息表情回应已停用或配置无效。')
         grant,row=self.chat.validate(sid,gid)
+        if ':direct:' in row['conversation_id']:raise Rejected('reaction_unavailable','私聊暂不支持消息表情回应。')
         if not grant['scope'].get('chat_reactions'):raise Rejected('reaction_not_authorized','此连接未获消息回应权限，请由用户在 MCP 界面选择。')
         if cancel.is_set():raise Rejected('cancelled','已取消，未派发回应。')
         status=self.chat.receiver.status()

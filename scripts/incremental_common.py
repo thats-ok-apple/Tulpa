@@ -29,7 +29,7 @@ def fingerprint(root, paths):
     return result
 
 
-def boundary(conn, table, id_column, identity_columns, previous, *, allow_server_ack=False):
+def boundary(conn, table, id_column, identity_columns, previous, *, allow_server_ack=False, replay_missing=False):
     # Validate the last native row as well as its number: resets/replaced DBs
     # must not silently jump over history. All identifiers come from readers.
     cols=','.join('"'+c+'"' for c in identity_columns)
@@ -40,10 +40,17 @@ def boundary(conn, table, id_column, identity_columns, previous, *, allow_server
         row=conn.execute(f'SELECT {cols} FROM "{table}" WHERE "{id_column}"=?',(previous['last'],)).fetchone()
         if row is not None and allow_server_ack and identity_columns==['server_id','create_time'] and row[0] and any(signature([empty,row[1]])==previous['signature'] for empty in (0,None)):
             replay=previous['last']-1
+        elif row is None and replay_missing:
+            # A deleted tail must trigger a full conversation replay, never a
+            # jump to its new maximum. Native identity conflicts still fail in
+            # Store and the caller commits the replay and cursor atomically.
+            replay=0
         elif row is None or signature(row)!=previous['signature']:
             raise ValueError('源消息游标失效：数据库可能被替换或清理。请补读历史后重建同步进度。')
     row=conn.execute(f'SELECT "{id_column}",{cols} FROM "{table}" ORDER BY "{id_column}" DESC LIMIT 1').fetchone()
     result=dict(last=row[0],signature=signature(row[1:])) if row else dict(last=0,signature='')
+    if replay==0 and previous and result['last']<previous['last']:
+        raise ValueError('源消息序列倒退；请补读历史后重建同步进度。')
     if replay is not None:result['replay_from']=replay
     return result
 

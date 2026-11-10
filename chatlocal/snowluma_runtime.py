@@ -1,6 +1,6 @@
 """Version-specific official admin API and owned Windows process operations.
 
-Written against v1.14.22 public schemas; no SnowLuma source is copied or patched.
+Adapters for v1.14.22 and audited v2 releases; no upstream source is patched.
 No discovery of passwords or attempt to control externally launched services.
 """
 import ctypes
@@ -21,7 +21,10 @@ from .snowluma_secure import ManagedError, atomic_json, local_path, read_json
 
 
 def process_identity(pid):
-    if os.name != 'nt' or type(pid) is not int or pid <= 0:
+    if os.name != 'nt':
+        from .platform_process import linux_identity
+        return linux_identity(pid)
+    if type(pid) is not int or pid <= 0:
         return None
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -121,7 +124,7 @@ class WindowsRuntime:
             raise ManagedError('hook_inventory_failed', '无法核对已有 QQ 接入管道，未启动新的 SnowLuma。') from None
 
     def spawn(self, directory, port, credentials, instance):
-        if os.name != 'nt':
+        if os.name != 'nt' and not isinstance(self,LinuxRuntime):
             raise ManagedError('platform_unsupported', '托管运行仅支持 Windows x64。')
         directory = local_path(directory)
         if self.hooks():
@@ -163,7 +166,8 @@ class WindowsRuntime:
             if re.fullmatch(r'onebot_\d{5,10}\.json', path.name):
                 atomic_json(path, dict(empty_config(), mode='snapshot'))
         # Official env API; never use DEV_MODE or accept agreements by env.
-        allowed = {'systemroot','windir','path','pathext','temp','tmp','userprofile','appdata','localappdata','programdata','systemdrive','comspec'}
+        allowed = {'systemroot','windir','path','pathext','temp','tmp','userprofile','appdata','localappdata','programdata','systemdrive','comspec',
+                   'home','lang','lc_all','xdg_runtime_dir','display','wayland_display','dbus_session_bus_address'}
         env = {k:v for k,v in os.environ.items() if k.lower() in allowed}
         env.update(SNOWLUMA_HOOK_AUTOLOAD='0', SNOWLUMA_WEBUI_HOST='127.0.0.1',
                    SNOWLUMA_WEBUI_PORT=str(port), SNOWLUMA_WEBUI_TRUST_PROXY='',
@@ -171,9 +175,10 @@ class WindowsRuntime:
         if not (config/'webui.json').exists():
             env['SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD'] = credentials['admin_password']
         try:
-            proc = subprocess.Popen([str(directory/'node.exe'), str(directory/'index.mjs')],
-                cwd=directory, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW)
+            from .snowluma_local import runtime_node
+            from .platform_process import owned_popen
+            proc = owned_popen([str(runtime_node(directory)), str(directory/'index.mjs')],
+                cwd=directory, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             raise ManagedError('spawn_failed', '官方运行包未能后台启动，请检查系统权限。') from None
         self._job(proc)
@@ -223,11 +228,96 @@ class WindowsRuntime:
             self.release_job(owner['pid'])
 
 
+class LinuxRuntime(WindowsRuntime):
+    """Same official management API, with uid/start-time and pidfd ownership."""
+    def hooks(self):
+        from .platform_process import linux_processes
+        folders={Path(f'/tmp/snowluma-{os.getuid()}')}
+        for key in ('XDG_RUNTIME_DIR','SNOWLUMA_HOOK_RUNTIME_DIR'):
+            if value:=os.environ.get(key):folders.add(Path(value))
+        # QQ can have been started from another terminal or desktop session.
+        for proc in linux_processes():
+            if Path(proc['executable']).name.lower()!='qq':continue
+            try:
+                entries=(Path('/proc')/str(proc['pid'])/'environ').read_bytes().split(b'\0')
+                env=dict(entry.split(b'=',1) for entry in entries if b'=' in entry)
+                for key in (b'SNOWLUMA_HOOK_RUNTIME_DIR',b'XDG_RUNTIME_DIR'):
+                    if env.get(key):folders.add(Path(os.fsdecode(env[key])))
+            except (OSError,ValueError):
+                raise ManagedError('hook_inventory_failed','无法核对当前 QQ 的接入目录，未启动另一个实例。') from None
+        found=set()
+        try:
+            for folder in folders:
+                if not folder.is_absolute():raise ValueError()
+                if not folder.exists():continue
+                for path in folder.iterdir():
+                    if match:=re.fullmatch(r'mojo\.(\d+)\.control\.sock',path.name):found.add(int(match[1]))
+        except (OSError,ValueError):
+            raise ManagedError('hook_inventory_failed','无法检查已有 QQ 接入套接字。') from None
+        return found
+
+    def _job(self,proc):
+        # Wait for the small parent-death wrapper to exec the selected Node.
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            identity=self.identity(proc.pid)
+            if identity and Path(identity['executable']).name=='node':
+                self.jobs[proc.pid]=proc
+                return
+            if proc.poll() is not None:break
+            time.sleep(.01)
+        from .platform_process import terminate_group
+        terminate_group(proc)
+        raise ManagedError('spawn_failed','Linux Node 未能启动，请检查运行库和执行权限。')
+
+    def release_job(self,pid):
+        proc=self.jobs.pop(pid,None)
+        if proc:
+            from .platform_process import terminate_group
+            terminate_group(proc)
+
+    def owned(self,owner,directory,instance):
+        if not owner or owner.get('instance')!=instance:return False
+        live=self.identity(owner.get('pid'))
+        if not live or any(live.get(k)!=owner.get(k) for k in ('pid','created','executable','boot_id')):return False
+        from .snowluma_local import runtime_node
+        if Path(live['executable']).resolve()!=runtime_node(directory).resolve():return False
+        try:
+            root=Path('/proc')/str(owner['pid'])
+            env=(root/'environ').read_bytes().split(b'\0')
+            cmd=(root/'cmdline').read_bytes().split(b'\0')
+            return (('TULPA_SNOWLUMA_INSTANCE='+instance).encode() in env
+                    and os.fsencode(Path(directory)/'index.mjs') in cmd)
+        except OSError:return False
+
+    def stop(self,owner,directory,instance):
+        import signal
+        if not owner:return False
+        try:fd=os.pidfd_open(owner['pid'])
+        except (OSError,KeyError):return False
+        try:
+            if not self.owned(owner,directory,instance):return False
+            signal.pidfd_send_signal(fd,signal.SIGTERM)
+            proc=self.jobs.get(owner['pid'])
+            if proc:
+                try:proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:signal.pidfd_send_signal(fd,signal.SIGKILL)
+            self.release_job(owner['pid'])
+            return True
+        except ProcessLookupError:return False
+        finally:os.close(fd)
+
+
+def default_runtime():
+    return WindowsRuntime() if os.name=='nt' else LinuxRuntime()
+
+
 class SnowLumaAPI:
     """Narrow management interface, only used for our own verified process."""
     def __init__(self, port, *, client_factory=httpx.Client):
         self.base = f'http://127.0.0.1:{port}'
         self.token = ''
+        self.version = '1.14.22'
         self.client_factory = client_factory
 
     def request(self, method, path, body=None):
@@ -270,6 +360,7 @@ class SnowLumaAPI:
             raise ManagedError('admin_protocol', '管理响应与已审核版本不符，已停止。') from None
 
     def initialize(self, password, manifest, check):
+        self.version = manifest['version']
         check()
         result = self.request('POST', '/api/login', dict(password=password))
         if not result.get('success') or not isinstance(result.get('token'), str) or not result['token']:
@@ -301,7 +392,15 @@ class SnowLumaAPI:
         return value
 
     def probe(self, pid):
-        value = self.request('GET', f'/api/processes/{pid}/probe-login').get('info')
+        if self.version in ('2.0.3', '2.1.0', '2.1.1'):
+            # v2 removed probe-login. The process snapshot provides detected
+            # account identity before attachment and native UIN after login.
+            rows = [row for row in self.processes() if row.get('pid') == pid]
+            if len(rows) != 1:return ''
+            row = rows[0]
+            value = row if row.get('loggedIn') is True else row.get('account')
+        else:
+            value = self.request('GET', f'/api/processes/{pid}/probe-login').get('info')
         uin = str(value.get('uin', '')) if isinstance(value, dict) else ''
         return uin if re.fullmatch(r'[1-9]\d{4,9}', uin) else ''
 

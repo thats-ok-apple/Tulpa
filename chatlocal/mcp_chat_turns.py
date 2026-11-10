@@ -3,6 +3,7 @@
 The session lock serializes expressions, not receiving, waiting or stopping.
 Freshness is checked again inside each existing adapter's dispatch guard.
 """
+from . import reply_timing as timing
 import hashlib
 import json
 import math
@@ -15,10 +16,12 @@ from .mcp_actions import dump
 TOOLS = {'plan_chat_reply', 'send_chat_reply'}
 DEFAULTS = dict(quiet_seconds=2., max_collect_seconds=8., reply_cooldown_seconds=3.,
                 batch_ttl_seconds=120., plan_ttl_seconds=90., bubble_min_seconds=1.2,
-                bubble_max_seconds=4., bubble_seconds_per_char=.035)
+                bubble_max_seconds=4., bubble_seconds_per_char=.035, quote_threshold=3,
+                detail_budget_seconds=3.)
 RANGES = dict(quiet_seconds=(.1,5), max_collect_seconds=(1,30), reply_cooldown_seconds=(0,60),
               batch_ttl_seconds=(10,300), plan_ttl_seconds=(5,180), bubble_min_seconds=(.1,5),
-              bubble_max_seconds=(.1,10), bubble_seconds_per_char=(0,.2))
+              bubble_max_seconds=(.1,10), bubble_seconds_per_char=(0,.2),
+              quote_threshold=(1,100), detail_budget_seconds=(.1,10))
 
 
 class TurnRejected(ValueError):
@@ -30,27 +33,33 @@ class TurnRejected(ValueError):
 def schema(tool):
     sid=dict(type='string',minLength=32,maxLength=32,description='原样复制工具返回的字符串；JSON 中必须带双引号。')
     key=dict(type='string',minLength=8,maxLength=80,description='可省略，由程序按当前批次/计划生成稳定编号；重试不能换参数。')
-    event=dict(type='integer',minimum=1,maximum=2**63-1)
+    event=dict(type='integer',minimum=1,maximum=2**63-1,description='来自所选 input_batch 的事件 id，不能使用旧批次或 QQ 消息编号。')
     return [tool('plan_chat_reply',
-        'Planner 阶段：根据 get/wait 返回的 input_batch.id，决定等待、沉默或参与，指定接谁的话和表达通道。'
-        '程序核对相关消息静默与新鲜度；READY 后按 next_call 先完成表达选择（有候选时可明确全不选），再进入 Replyer。只写简短沟通意图，不写思维链、不发进群。',
+        'Planner 阶段：根据 get/wait 返回的 input_batch.id 决定。target_event_id/topic_event_ids 都来自所选批次；reply 选非空 expressions，wait/silence 不带表达。'
+        '程序核对相关消息静默与新鲜度；READY 返回候选，下一次直接 send_chat_reply 同时提交 expression_ids 和 bubbles，选择与表达合为一次决策。只写简短沟通意图，不发进群。',
         dict(session_id=sid,idempotency_key=key,batch_id=sid,
              action=dict(type='string',enum=['wait','silence','reply']),
              target_event_id=event, topic_event_ids=dict(type='array',maxItems=5,uniqueItems=True,items=event),
              topic_terms=dict(type='array',maxItems=6,uniqueItems=True,items=dict(type='string',minLength=2,maxLength=24)),
-             expressions=dict(type='array',maxItems=3,uniqueItems=True,items=dict(type='string',enum=['text','sticker','reaction'])),
+             expressions=dict(type='array',maxItems=3,uniqueItems=True,description='action=reply 时非空；wait/silence 省略或传 []。',items=dict(type='string',enum=['text','sticker','reaction','voice','video','file','ai_voice','qq_action'])),
              intent=dict(type='string',minLength=1,maxLength=200),
              wait_seconds=dict(type='number',minimum=0,maximum=30)),
         ['session_id','batch_id','action','intent']),
         tool('send_chat_reply',
         'Replyer 阶段：按 READY 计划一次提交 1–3 个语义气泡，不按标点机械拆句。'
-        '有学习候选的文字回复须先 select_chat_expressions，选 0–5 条；未选择会返回 expression_selection_required。'
-        '程序串行发送、气泡间留间隔并重新检查相关新消息/停止/授权。STALE 需补读重规划，已发不撤回，旧尾部不续发；UNKNOWN 禁止重试。'
-        '纯 reaction、纯表情包均可结束本轮，不必配文。',
+        '有学习候选时同时提交 expression_ids（0–5 个候选 ID；[] 明确不用）和 bubbles，无需先调用 select_chat_expressions。兼容此前已单独完成的选择；缺少明确选择仍拒绝发送。'
+        '程序串行发送、气泡间留间隔并重新检查相关新消息/停止/授权。STALE 附 updated_chat 时直接重规划，has_more 先分页；否则沿 recovery 补读。已发不撤回，旧尾部不续发；UNKNOWN 禁止重试。'
+        '纯 reaction、图片、语音、视频、文件均可结束本轮，不必配文。voice/video/file 气泡使用 import_qq_media 的 asset_id；ai_voice 使用 character_id 和 text；qq_action 使用 tool、action、params。',
         dict(session_id=sid,plan_id=sid,idempotency_key=key,
+             expression_ids=dict(type='array',maxItems=5,uniqueItems=True,items=sid,
+                                 description='从本计划 learned_language.candidates 选 0–5 个 ID；[] 明确不用。与 bubbles 一起提交，重试保持相同选择。'),
              bubbles=dict(type='array',minItems=1,maxItems=3,items=dict(type='object',additionalProperties=False,
-                properties=dict(kind=dict(type='string',enum=['text','sticker','reaction']),
+                properties=dict(kind=dict(type='string',enum=['text','sticker','reaction','voice','video','file','ai_voice','qq_action']),
                     text=dict(type='string',minLength=1,maxLength=4000),sticker_id=sid,
+                    asset_id=sid,folder_id=dict(type='string',minLength=1,maxLength=512),
+                    character_id=dict(type='string',minLength=1,maxLength=200),
+                    tool=dict(type='string',enum=['qq_interact','qq_message_action']),
+                    action=dict(type='string',minLength=1,maxLength=80),params=dict(type='object'),
                     event_id=event,reaction_id=dict(type='string',maxLength=64),
                     operation=dict(type='string',enum=['add','remove']),
                     quote=dict(type='boolean'),mention_user_ids=dict(type='array',maxItems=5,uniqueItems=True,
@@ -95,6 +104,7 @@ class ChatTurns:
             for key,value in policy.items():
                 low,high=RANGES[key]
                 if type(value) not in (float,int) or not math.isfinite(value) or not low<=value<=high: raise ValueError()
+            if int(policy['quote_threshold'])!=policy['quote_threshold']:raise ValueError()
             if policy['bubble_max_seconds']<policy['bubble_min_seconds']:raise ValueError()
             return policy
         except (ValueError,OSError):
@@ -104,11 +114,14 @@ class ChatTurns:
         with self.locks_guard:return self.locks.setdefault(sid,threading.Lock())
 
     def rejected(self,exc,sid=None):
+        timing.note(session_id=sid, error_code=exc.code)
         result=dict(state='REJECTED',error_code=exc.code,note=str(exc),**exc.details)
-        refresh={'stale','needs_refresh','batch_expired','plan_expired','target_expired','plan_missing','plan_not_ready','target_not_in_batch'}
-        if exc.code in refresh:
+        refresh={'stale','needs_refresh','batch_expired','plan_expired','target_expired','plan_missing','plan_not_ready'}
+        if 'correction_call' in result:
+            result['recovery']=dict(action='correct_request',automatic_write_retry=False,next_call=result.pop('correction_call'))
+        elif exc.code in refresh:
             result['recovery']=dict(action='refresh_and_replan',automatic_write_retry=False,
-                next_call=dict(tool='get_chat_session',arguments=dict(session_id=sid)))
+                next_call=self.recovery_read(sid))
         elif exc.code in {'needs_wait','reply_cooldown','source_unavailable','queue_busy'}:
             delay=min(30,max(1,exc.details.get('wait_seconds',2)))
             continuation=self.chat.continuation(sid)
@@ -121,8 +134,27 @@ class ChatTurns:
             result['recovery']=dict(action='fix_request_or_stop',automatic_write_retry=False)
         return result
 
+    def recovery_read(self,sid):
+        row=self.chat.row(sid)
+        return dict(tool='get_chat_session',arguments=dict(session_id=sid,response_format='compact',
+                    known_prompt_version=row.get('prompt_delivered_version','')))
+
+    def quote_guidance(self,p,data):
+        target=data.get('target_event_id');threshold=self.policy()['quote_threshold']
+        rows=self.data(p['session_id']);index={m['id']:m for m in rows}
+        count=None
+        if target in index:
+            count=len({m['onebot_message_id'] for m in rows if target<m['id']<=data['watermark']
+                       and m.get('delivered') and not any(m.get(k) for k in ('is_self','synthetic','recalled'))})
+        return dict(target_event_id=target,messages_after_target=count,threshold=threshold,
+                    quote_recommended=bool(count is not None and count>=threshold),
+                    rule='同一次 Replyer 组织正文时决定首条文字的 quote；间隔达到阈值建议引用，可按指代歧义覆盖。回应整个话题可不引用，不自动@，不为引用另读或等待。')
+
+    @timing.stage('turn.batch')
     def batch(self,row,items,collection=None):
         now=time.time();bid=uuid.uuid4().hex;ids=[m['id'] for m in items]
+        timing.note(session_id=row['id'], batch_id=bid, batch_created_at=now,
+                    event_ids=ids[:50], collection_reason=(collection or {}).get('reason'))
         with self.access.connect() as db:
             db.execute('INSERT INTO chat_input_batches VALUES(?,?,?,?,?,?,?)',
                        (bid,row['id'],self.epoch,now,max(ids,default=row['cursor']),dump(ids),row['gap_count']))
@@ -137,7 +169,7 @@ class ChatTurns:
                     collection=collection or dict(reason='context_read',ready_to_send=False),bursts=bursts,
                     plan_call=dict(tool='plan_chat_reply',arguments=dict(session_id=row['id'],batch_id=bid),
                                    requires=['action','intent'],optional=['target_event_id','expressions']),
-                    next='plan_chat_reply；普通读取不豁免静默或发送前检查。')
+                    next='plan_chat_reply：target_event_id/topic_event_ids 仅用本批事件；reply 选表达，wait/silence 不带表达。读取不豁免发送前检查。')
 
     def status(self,row):
         with self.access.connect() as db:
@@ -148,10 +180,14 @@ class ChatTurns:
                else 'SENDING' if p and p['state']=='SENDING' else 'DECIDING')
         return dict(phase=phase,last_plan=dict(p) if p else None)
 
-    def remaining_wait(self,sid):
+    def waiting(self,sid):
         with self.access.connect() as db:
             p=db.execute("SELECT payload FROM chat_turn_plans WHERE session_id=? AND state='WAITING' ORDER BY created DESC LIMIT 1",(sid,)).fetchone()
-        return max(0,json.loads(p[0])['not_before']-time.time()) if p else 0
+        return json.loads(p[0]) if p else None
+
+    def remaining_wait(self,sid):
+        p=self.waiting(sid)
+        return max(0,p['not_before']-time.time()) if p else 0
 
     def data(self,sid):
         with self.access.connect() as db:
@@ -159,15 +195,35 @@ class ChatTurns:
         return [dict(json.loads(r['payload']),id=r['id'],delivered=bool(r['delivered'])) for r in rows]
 
     @staticmethod
-    def related(message,focus,account):
-        if message.get('is_self'):return False
-        if focus.get('all'):return True
-        if message['sender_id'] in focus['senders']:return True
-        for seg in message.get('segments',[]):
-            if seg.get('type')=='reply' and seg.get('onebot_message_id') in focus['message_ids']:return True
-            if seg.get('type')=='at' and seg.get('qq')==account:return True
-        text=message.get('content','').casefold()
-        return any(term.casefold() in text for term in focus['terms'])
+    def related_messages(messages,focus,account):
+        peers=[m for m in messages if not m.get('is_self')]
+        if focus.get('all'):return peers
+        message_ids=set(map(str,focus['message_ids']))
+        terms=[term.casefold() for term in focus['terms']]
+        following=set();related=[];started=False
+        # Follow the chosen conversation in event order. A participant who
+        # explicitly addresses another conversation takes their unmarked
+        # followups with them; their identity alone must not stall this reply.
+        # Quoting this thread, addressing us or a selected topic term brings
+        # them back. No timeout guesses away a late, unaddressed correction.
+        for message in messages:
+            sender=message['sender_id'];mid=str(message['onebot_message_id'])
+            if mid in message_ids:started=True
+            if not started or message.get('is_self'):continue
+            replies={str(s.get('onebot_message_id')) for s in message.get('segments',[]) if s.get('type')=='reply'}
+            mentions={str(s.get('qq')) for s in message.get('segments',[]) if s.get('type')=='at' and s.get('qq') not in ('all','',None)}
+            direct=(mid in message_ids or bool(replies & message_ids) or account in mentions
+                    or any(term in message.get('content','').casefold() for term in terms))
+            if direct:following.add(sender)
+            elif replies or mentions:
+                following.discard(sender)
+                continue
+            elif sender not in following:continue
+            related.append(message)
+            # Preserve reply chains, including another participant quoting a
+            # supplement and then adding an unmarked correction of their own.
+            message_ids.add(mid)
+        return related
 
     def collection(self,row,pending,quiet,started):
         policy=self.policy();items=self.chat.messages(pending)
@@ -176,8 +232,8 @@ class ChatTurns:
         # The oldest pending speaker anchors this bounded collection. Unrelated
         # hot-group traffic cannot slide its tail forever. @ is prioritized later.
         anchor=peers[0]
-        focus=dict(senders=[anchor['sender_id']],message_ids=[anchor['onebot_message_id']],terms=[])
-        relevant=[m for m in peers if self.related(m,focus,row['conversation_id'].split(':')[0])]
+        focus=dict(message_ids=[anchor['onebot_message_id']],terms=[])
+        relevant=self.related_messages(peers,focus,row['conversation_id'].split(':')[0])
         remaining=max(0,quiet-(time.time()-max(m['received_at'] for m in relevant)))
         capped=time.monotonic()-started>=policy['max_collect_seconds']
         return dict(ready=remaining==0 or capped,reason='collection_limit' if capped and remaining else 'quiet' if not remaining else 'collecting',
@@ -219,13 +275,18 @@ class ChatTurns:
                 db.execute('UPDATE chat_turn_plans SET payload=? WHERE id=?',(dump(payload),p['id']))
             p['payload']=dump(payload)
 
+    @timing.stage('turn.prepare_output')
     def public(self,p):
         data=json.loads(p['payload'])
+        timing.note(session_id=p['session_id'], plan_id=p['id'], batch_id=data['batch_id'],
+                    batch_created_at=data['read_at'], plan_created_at=p['created'], state=p['state'],
+                    target_event_ids=data.get('focus_ids',[])[:5])
         result=dict(plan_id=p['id'],state=p['state'],phase='REPLYING' if p['state']=='READY' else p['state'],
                     decision={k:data[k] for k in ('action','target_event_id','expressions','intent','batch_id','watermark','wait_seconds')},
                     bubbles=json.loads(p['queue']),reason=p['reason'],turn_complete=p['state'] in ('SUCCEEDED','SILENT'),
                     next='同一 Agent 组织表达后调用 send_chat_reply' if p['state']=='READY' else '继续 wait_chat_messages；旧队列尾部不会恢复')
         if p['state']=='READY':
+            result['quote_guidance']=self.quote_guidance(p,data)
             result['next_call']=dict(tool='send_chat_reply',arguments=dict(session_id=p['session_id'],plan_id=p['id']),requires=['bubbles'])
             if hasattr(self.chat,'learning'):
                 context=self.chat.learning.plan_context(p)
@@ -233,15 +294,18 @@ class ChatTurns:
                     result['learned_language']=context
                     if context.get('selection_required'):
                         result['phase']='SELECTING_EXPRESSION'
-                        result['next']='先选择本轮表达参考，expression_ids=[] 表示明确不用；完成后再组织文字。'
-                        result['next_call']=context['select_call']
-        elif p['state'] in ('WAITING','SILENT','SUCCEEDED'):
+                        result['next']='结合候选选择表达并组织文字，直接 send_chat_reply 一起提交 expression_ids 和 bubbles；[] 明确不用，不必单独调用选择工具。'
+                        result['next_call']['requires']=['expression_ids','bubbles']
+        elif p['state']=='WAITING':
+            result['next']='暂缓决定，尚未处理完本批；沿 next_call 等待，到期或新输入后重新规划。'
+            result['next_call']=self.chat.continuation(p['session_id'])
+        elif p['state'] in ('SILENT','SUCCEEDED'):
             result['next_call']=self.chat.continuation(p['session_id'],through=data['watermark'])
         else:
             # Neither a pending/unknown queue nor an interrupted tail is a new
             # write request. Reading the durable receipt is always the next step.
             result['recovery']=dict(action='inspect_result',automatic_write_retry=False,
-                next_call=dict(tool='get_chat_session',arguments=dict(session_id=p['session_id'])))
+                next_call=self.recovery_read(p['session_id']))
         audit=json.loads(p['payload']).get('expression_selection')
         if audit:result['expression_selection']=audit
         return result
@@ -252,6 +316,7 @@ class ChatTurns:
                        (state,dump(json.loads(p['queue']) if queue is None else queue),reason,time.time(),p['id']))
         return self.load(p['id'],p['session_id'])
 
+    @timing.stage('turn.freshness_check')
     def check(self,p,cancel,*,cooldown=False):
         data=json.loads(p['payload']);sid=p['session_id']
         _,row=self.chat.validate(sid,data['grant_id'])
@@ -277,7 +342,7 @@ class ChatTurns:
             for item in json.loads(queued[0]):
                 mid=item.get('receipt',{}).get('result',{}).get('message_id')
                 if mid:focus['message_ids'].append(str(mid))
-        relevant=[m for m in rows if self.related(m,focus,account)]
+        relevant=self.related_messages(rows,focus,account)
         fresh=[m['id'] for m in relevant if m['id']>data['watermark']]
         if fresh:raise TurnRejected('stale','目标相关的新消息尚未纳入决策，请补读并重新规划。',refresh_event_ids=fresh[:12])
         last=max((m['received_at'] for m in relevant),default=data['read_at']-policy['quiet_seconds'])
@@ -289,6 +354,7 @@ class ChatTurns:
             if prev and now-prev<policy['reply_cooldown_seconds']:
                 raise TurnRejected('reply_cooldown','上一轮表达刚结束，请留出接话空隙。',wait_seconds=round(policy['reply_cooldown_seconds']-(now-prev),2))
 
+    @timing.stage('turn.plan')
     def plan(self,grant,args,cancel):
         sid=args['session_id'];self.chat.validate(sid,grant['id'])
         args=dict(args)
@@ -306,14 +372,17 @@ class ChatTurns:
                 return self.public(dict(old))
             policy=self.policy();now=time.time()
             if not batch or batch['epoch']!=self.epoch or now-batch['created']>policy['batch_ttl_seconds']:
-                raise TurnRejected('batch_expired','读取批次已失效，请 get/wait 后规划。')
+                raise TurnRejected('batch_expired','读取批次已失效；使用 updated_chat 重规划，未附更新才按 recovery 补读。')
             target=args.get('target_event_id');focus_ids=list(dict.fromkeys(([target] if target else [])+args.get('topic_event_ids',[])))
+            correction=dict(correction_call=dict(tool='plan_chat_reply',arguments=dict(session_id=sid,batch_id=batch['id']),
+                requires=['action','intent']),valid_event_ids=json.loads(batch['ids']),
+                parameter_rule='target_event_id 和 topic_event_ids 仅从 valid_event_ids 选；reply 必须选 expressions，wait/silence 省略或 []；自行修正后提交。')
             if any(eid not in json.loads(batch['ids']) for eid in focus_ids):
-                raise TurnRejected('target_not_in_batch','目标或话题消息必须来自所选已读批次。')
+                raise TurnRejected('target_not_in_batch','目标或话题消息不在本批，按返回编号修正；无需先读会话。',**correction)
             rows=self.data(sid);index={m['id']:m for m in rows};focus_rows=[index[eid] for eid in focus_ids if eid in index]
             if len(focus_rows)!=len(focus_ids):raise TurnRejected('target_expired','目标已淘汰，请补读。')
             expressions=args.get('expressions',[])
-            if (args['action']=='reply')!=bool(expressions):raise TurnRejected('expression_mismatch','参与时选择表达类型；等待或沉默不提交表达。')
+            if (args['action']=='reply')!=bool(expressions):raise TurnRejected('expression_mismatch','reply 选择表达；wait/silence 不提交表达。保留原决定，自行修正参数。',**correction)
             with self.access.connect() as db:
                 waiting=db.execute("SELECT payload FROM chat_turn_plans WHERE session_id=? AND state='WAITING' ORDER BY created DESC LIMIT 1",(sid,)).fetchone()
             if waiting and args['action']=='reply':
@@ -324,10 +393,15 @@ class ChatTurns:
                 raise TurnRejected('reaction_permission','仅回应也需要真实目标和回应授权。')
             if 'sticker' in expressions and not grant['scope'].get('chat_sticker_send'):
                 raise TurnRejected('sticker_permission','连接未获发送表情包权限。')
-            focus=dict(senders=list({m['sender_id'] for m in focus_rows if not m['is_self']}),
-                       message_ids=[m['onebot_message_id'] for m in focus_rows],terms=args.get('topic_terms',[]),all=not bool(focus_ids))
+            for expression,flag in (('voice','chat_voice'),('ai_voice','chat_voice'),('video','chat_video'),('file','chat_files')):
+                if expression in expressions and not grant['scope'].get(flag):raise TurnRejected('attachment_permission','连接没有所选附件权限。')
+            if 'qq_action' in expressions and not any(grant['scope'].get(f) for f in ('qq_messages','qq_interactions')):
+                raise TurnRejected('qq_permission','连接没有消息操作或互动权限。')
+            if 'reaction' in expressions and ':direct:' in self.chat.row(sid)['conversation_id']:
+                raise TurnRejected('reaction_unavailable','私聊暂不支持消息表情回应。')
             # Untargeted proactive replies use all peer input as their subject.
-            if not focus_ids:focus['senders']=list({m['sender_id'] for m in rows if not m['is_self']})
+            focus=dict(message_ids=[m['onebot_message_id'] for m in focus_rows],
+                       terms=args.get('topic_terms',[]),all=not bool(focus_ids))
             row=self.chat.row(sid);pid=uuid.uuid4().hex
             data=dict(action=args['action'],target_event_id=target,focus_ids=focus_ids,focus=focus,
                 expressions=expressions,intent=args['intent'],batch_id=batch['id'],watermark=batch['watermark'],
@@ -337,6 +411,7 @@ class ChatTurns:
                 data['expression_selection']=dict(state='not_applicable',reason='no_reply',delivery='none',
                     candidate_ids=[],selected_ids=[],host_injection='unverified',model_use='unverified')
             candidate=dict(id=pid,session_id=sid,payload=dump(data),created=now)
+            if cancel.is_set():raise TurnRejected('cancelled','本次规划已取消。')
             if args['action']=='reply':self.check(candidate,cancel,cooldown=True)
             state={'reply':'READY','wait':'WAITING','silence':'SILENT'}[args['action']]
             with self.access.connect() as db:
@@ -354,6 +429,7 @@ class ChatTurns:
         current=getattr(self.dispatch,'current',None)
         if current:self.check(current[0],current[1])
 
+    @timing.stage('turn.submit')
     def submit(self,grant,args,cancel):
         sid=args['session_id'];self.chat.validate(sid,grant['id'])
         if not args.get('plan_id'):return self.rejected(TurnRejected('plan_required','先用最新 input_batch 调用 plan_chat_reply；不能跳过 Planner 直接发送。'),sid)
@@ -361,24 +437,58 @@ class ChatTurns:
         if not lock.acquire(False):return self.rejected(TurnRejected('queue_busy','同一会话已有发送队列；稍后以原计划查询，勿换编号重发。'),sid)
         try:
             p=self.load(args['plan_id'],sid);data=json.loads(p['payload']);bubbles=args['bubbles']
-            signature=hashlib.sha256(dump(bubbles).encode()).hexdigest()
+            submitted=dict(bubbles=bubbles,expression_ids=args['expression_ids']) if 'expression_ids' in args else bubbles
+            signature=hashlib.sha256(dump(submitted).encode()).hexdigest()
             if p['queue_signature']:
                 if p['queue_signature']!=signature:raise TurnRejected('idempotency_conflict','该计划已经提交了另一组表达，不能替换或重发。')
                 return self.public(p)
             if p['state']!='READY':raise TurnRejected('plan_not_ready','该计划不可发送，请读取结果或补读重规划。')
             if not isinstance(bubbles,list) or not 1<=len(bubbles)<=3:raise TurnRejected('invalid_bubbles','一次提交 1–3 个语义气泡。')
             for i,b in enumerate(bubbles):
-                kind=b['kind'];allowed={'text':{'kind','text','quote','mention_user_ids'},'sticker':{'kind','sticker_id'},'reaction':{'kind','event_id','reaction_id','operation'}}[kind]
+                kind=b['kind'];allowed={'text':{'kind','text','quote','mention_user_ids'},'sticker':{'kind','sticker_id'},'reaction':{'kind','event_id','reaction_id','operation'},
+                    'voice':{'kind','asset_id'},'video':{'kind','asset_id'},'file':{'kind','asset_id','folder_id'},
+                    'ai_voice':{'kind','text','character_id'},'qq_action':{'kind','tool','action','params'}}[kind]
                 if set(b)-allowed or kind not in data['expressions']:raise TurnRejected('expression_mismatch','表达类型或字段与计划不一致。')
-                required={'text':{'text'},'sticker':{'sticker_id'},'reaction':{'event_id','reaction_id','operation'}}[kind]
+                required={'text':{'text'},'sticker':{'sticker_id'},'reaction':{'event_id','reaction_id','operation'},
+                    'voice':{'asset_id'},'video':{'asset_id'},'file':{'asset_id'},'ai_voice':{'text','character_id'},'qq_action':{'tool','action','params'}}[kind]
                 if required-set(b):raise TurnRejected('expression_mismatch','表达缺少必要内容。')
                 if kind=='reaction' and b['event_id']!=data['target_event_id']:raise TurnRejected('target_mismatch','回应目标与计划不一致。')
                 if kind=='text' and i and (b.get('quote') or b.get('mention_user_ids')):raise TurnRejected('repeated_addressing','同一轮仅首条按需引用或 @；改变目标需重新规划。')
+                if kind=='qq_action':
+                    from .mcp_qq_catalog import CATALOG
+                    from .mcp_qq import OUTBOUND
+                    import jsonschema
+                    spec=CATALOG.get(b['tool'],{});entry=spec.get('actions',{}).get(b['action'])
+                    if not entry or b['action'] not in OUTBOUND or not grant['scope'].get(spec.get('permission')):
+                        raise TurnRejected('qq_action_invalid','聊天队列只接受已授权的发送或互动动作。')
+                    if not jsonschema.Draft202012Validator(entry['params']).is_valid(b['params']):
+                        raise TurnRejected('qq_action_invalid','动作参数格式无效，请按对应工具的参数定义修正。')
+                if kind in ('voice','video','file'):self.chat.qq.media.get(grant,b['asset_id'],kind)
+                if kind=='ai_voice' and ':direct:' in self.chat.row(sid)['conversation_id']:
+                    raise TurnRejected('ai_voice_group_only','QQ AI 语音只支持群聊。')
             self.check(p,cancel,cooldown=True)
+            if 'expression_ids' in args:
+                if not any(b['kind']=='text' for b in bubbles):
+                    if args['expression_ids']:
+                        raise TurnRejected('expression_mismatch','纯媒体表达不选择文字参考。')
+                elif hasattr(self.chat,'learning'):
+                    context=self.public(p).get('learned_language',{})
+                    if context.get('expression_decision',{}).get('state') in ('not_applicable','unavailable'):
+                        # Paused/unavailable learning must not block ordinary
+                        # chat when a host consistently submits an empty list.
+                        if args['expression_ids']:raise TurnRejected('invalid_selection','本轮没有可选择的表达参考。')
+                    else:
+                        with timing.span('learning.inline_selection'):
+                            choice=self.chat.learning.call(grant,'select_chat_expressions',
+                                dict(session_id=sid,plan_id=p['id'],expression_ids=args['expression_ids']))
+                        if choice.get('error_code'):
+                            raise TurnRejected(choice['error_code'],choice['note'])
+                    p=self.load(p['id'],sid)
+                    data=json.loads(p['payload'])
             if any(b['kind']=='text' for b in bubbles) and hasattr(self.chat,'learning'):
                 prepared=self.public(p)
                 if prepared.get('learned_language',{}).get('selection_required'):
-                    raise TurnRejected('expression_selection_required','先明确选择本轮的 0–5 条表达参考；全不选也可以。尚未发送。',
+                    raise TurnRejected('expression_selection_required','send_chat_reply 同时提交 expression_ids（[] 明确不用）和 bubbles；也兼容先调用选择工具。尚未发送。',
                         next_call=prepared['next_call'],learned_language=prepared['learned_language'])
             elif 'text' in data['expressions']:
                 # A mixed plan may ultimately use only a sticker/reaction. Keep
@@ -400,13 +510,15 @@ class ChatTurns:
                             cfg=self.policy();previous=bubbles[i-1].get('text','')
                             delay=min(cfg['bubble_max_seconds'],cfg['bubble_min_seconds']+len(previous)*cfg['bubble_seconds_per_char'])
                             until=time.monotonic()+delay
-                            while time.monotonic()<until:
-                                self.check(p,cancel)
-                                cancel.wait(min(.1,max(0,until-time.monotonic())))
+                            with timing.span('send.bubble_interval'):
+                                while time.monotonic()<until:
+                                    self.check(p,cancel)
+                                    cancel.wait(min(.1,max(0,until-time.monotonic())))
                         self.check(p,cancel)
                         call=self.access.begin_call(grant['id'],'send_chat_sticker' if item['expression']['kind']=='sticker' else 'chat_expression')
                         b=item['expression'];key='turn-'+p['id']+'-'+str(i)
                         item['state']='DISPATCHING';self.save(p,'SENDING',queue)
+                        expression_started=time.monotonic()
                         try:
                             if b['kind']=='text':
                                 params=dict(session_id=sid,idempotency_key=key,**{k:v for k,v in b.items() if k!='kind'})
@@ -414,8 +526,10 @@ class ChatTurns:
                                 result=self.chat.send(grant,params,cancel)
                             elif b['kind']=='sticker':
                                 result,_=self.chat.media.call(grant,'send_chat_sticker',dict(session_id=sid,idempotency_key=key,sticker_id=b['sticker_id']),cancel)
-                            else:
+                            elif b['kind']=='reaction':
                                 result=self.chat.reactions.request(grant,dict(session_id=sid,idempotency_key=key,**{k:v for k,v in b.items() if k!='kind'}),cancel)
+                            else:
+                                result=self.chat.qq.send_bubble(grant,self.chat.row(sid),b,key,cancel)
                             item['state']=result.get('state','UNKNOWN');item['receipt']=result
                             if item['state'] not in ('SUCCEEDED','NOOP'):
                                 try:self.check(p,cancel)
@@ -429,7 +543,10 @@ class ChatTurns:
                         except Exception:
                             item['state']='UNKNOWN'
                             raise
-                        finally:self.access.finish_call(call,item['state'].lower(),0,0)
+                        finally:
+                            self.access.finish_call(call,item['state'].lower(),time.monotonic()-expression_started,0)
+                            timing.note(plan_id=p['id'], bubble_index=i, state=item['state'],
+                                        expression_seconds=round(time.monotonic()-expression_started,6))
                         self.save(p,'SENDING',queue)
                         if item['state'] not in ('SUCCEEDED','NOOP'):break
                     except (TurnRejected,ValueError) as exc:
@@ -450,13 +567,14 @@ class ChatTurns:
 
     def single(self,grant,name,args,cancel):
         kinds={'send_chat_message':'text','send_chat_sticker':'sticker','react_to_chat_message':'reaction'}
-        bubble={'kind':kinds[name],**{k:v for k,v in args.items() if k not in ('session_id','plan_id','idempotency_key','reply_to_event_id')}}
+        bubble={'kind':kinds[name],**{k:v for k,v in args.items() if k not in ('session_id','plan_id','idempotency_key','reply_to_event_id','expression_ids')}}
         if args.get('reply_to_event_id') and args.get('plan_id'):
             p=self.load(args['plan_id'],args['session_id'])
             if json.loads(p['payload'])['target_event_id']!=args['reply_to_event_id']:
                 return dict(state='REJECTED',error_code='target_mismatch',note='回应对象与计划不同。')
         outcome=self.submit(grant,dict(session_id=args['session_id'],plan_id=args.get('plan_id'),
-                          idempotency_key=args['idempotency_key'],bubbles=[bubble]),cancel)
+                          idempotency_key=args['idempotency_key'],bubbles=[bubble],
+                          **({'expression_ids':args['expression_ids']} if 'expression_ids' in args else {})),cancel)
         queue=outcome.get('bubbles',[])
         if len(queue)==1 and queue[0].get('receipt'):
             return dict(queue[0]['receipt'],chat_turn=outcome)

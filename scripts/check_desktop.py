@@ -6,13 +6,15 @@ import tempfile
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from chatlocal.desktop_routes import install_desktop_routes
 
 
 def main():
-    with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='desktop-settings-') as name,patch.dict('os.environ',{},clear=True):
+    with tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='desktop-settings-') as name,patch.dict('os.environ',isolated_env(),clear=True):
         root=Path(name);(root/'.tmp').mkdir();app=FastAPI();install_desktop_routes(app,root);c=TestClient(app)
         assert c.get('/api/ui-preferences').json()==dict(show_reasoning=True)
         assert c.put('/api/ui-preferences',json=dict(show_reasoning=False)).status_code==403

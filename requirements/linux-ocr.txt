@@ -1,0 +1,4 @@
+# Optional CPU OCR, on both Linux x86_64 and aarch64.
+rapidocr==3.9.2
+onnxruntime==1.30.0
+-r linux-opencv.txt

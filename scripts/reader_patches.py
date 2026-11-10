@@ -83,6 +83,18 @@ def patch_qq_passive_scan(data):
         b'No verified QQ key available after passive scan/cache checks; this does not imply QQ is closed.')
     compile(data, 'qq_db.py', 'exec')
     return data.replace(b'\n', b'\r\n') if crlf else data
+def patch_qq_blank_text(data):
+    begin=data.index(b'def _extract_msg_text(')
+    end=data.index(b'\ndef _extract_qq_attachment_meta(',begin)
+    block=data[begin:end]
+    before=b'    return " ".join(out)\n'
+    if block.count(before)!=1:
+        raise ValueError('QQ text decoder changed; review blank-text preservation')
+    after='''    # Native text elements can contain only whitespace (for example, an
+    # @mention envelope). Preserve the row without promoting metadata to text.
+    return " ".join(out) if out else "[空白文本]" if any(parts) else ""
+'''.encode('utf-8')
+    return data[:begin]+block.replace(before,after)+data[end:]
 
 def patch_qq_proxy(data):
     before=b'    return [sys.executable, "-I", "-u", str(helper), *arguments]'
@@ -145,6 +157,16 @@ _k32.ReadProcessMemory.argtypes = [
     after=b'if sys.platform == "win32":\n'+b'\n'.join(b'    '+line for line in before.splitlines())+b'\nelse:\n    _k32 = None'
     data=data.replace(before,after)
     notice=b'# Modified by Tulpa contributors: bounded Windows recovery and Mac cache-only reads; see scripts/reader_patches.py.\n'
+    start=data.index(b'def _locate_account_root(')
+    end=data.index(b'\ndef auto_detect_db_dir(',start)
+    discovery=data[start:end]
+    # E:\\ is absolute; stripping its separator produces the drive-relative E:.
+    for name in (b'root',b'cand'):
+        before=name+b' = '+name+b'.rstrip("\\\\/")'
+        if discovery.count(before)!=1:
+            raise ValueError('WeChat directory discovery changed; review drive-root preservation')
+        discovery=discovery.replace(before,name+b' = os.path.normpath('+name+b')')
+    data=data[:start]+discovery+data[end:]
     adapter=b'''\n\n# Keep parser/crypto portable; Mac process-key recovery is an explicit separate action.
 if sys.platform == "darwin":
     from pathlib import Path as _TulpaPath

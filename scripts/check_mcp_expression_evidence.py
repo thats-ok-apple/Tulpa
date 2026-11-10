@@ -52,7 +52,10 @@ def main():
                         evidence_quote=quote,surface_form=form,form_type='wording')
             check_expression(single,{'fixture':dict(source='PEER',text=quote)},LearningError)
         assert s.status(b)['expression_count']==0
-        submit(t,valid);review=s.claim(b,'fixture-context');good=review_fixture(review)
+        submit(t,valid)
+        jt=s.claim(b,'fixture-context');assert jt['stage']=='extract_jargon'
+        submit(jt,dict(jargon=[]))
+        review=s.claim(b,'fixture-context');good=review_fixture(review)
         for reason in ('符合小鲸鱼人格','这是本轮实际做法','机器人应该这样回应'):
             bad=deepcopy(good);bad['reviews'][0]['reason']=reason;denied('expression_review_unsupported',lambda:submit(review,bad))
         bad=deepcopy(good);bad['reviews'][0]['checks']['source_supported']=False

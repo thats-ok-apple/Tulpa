@@ -45,7 +45,9 @@ def main():
         # Identical audio shares one backend/model-specific transcript across platforms.
         svc=VoiceService(store);audio=svc.root/'audio';audio.mkdir();wav=audio/('a'*64+'.wav')
         with wave.open(str(wav),'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(16000);w.writeframes(b'\0'*32000)
-        with patch('chatlocal.voice.profile',return_value='fixture-profile'):
+        cfg=config();cfg.update(model=root/'fixture-model',executable=root/'fixture-executable')
+        cfg['model'].touch();cfg['executable'].touch()
+        with patch('chatlocal.voice.config',return_value=cfg),patch('chatlocal.voice.profile',return_value='fixture-profile'):
             with store.connect() as db:
                 db.execute('INSERT INTO voice_transcripts VALUES(?,?,?,?,?,?,?)',('a'*64,'fixture-profile','明天下午三點在實驗室提交 Router 報告','zh','whisper.cpp','fixture',time.time()))
                 db.execute("UPDATE voice_sources SET audio_sha256=?,wav_path=?,duration_ms=1000 WHERE message_id IN (1,2)",('a'*64,str(wav.relative_to(ROOT))))
@@ -86,7 +88,8 @@ def main():
         with store.connect() as db:assert db.execute('SELECT count(*) FROM voice_transcripts').fetchone()[0]==0
         assert put(rows,discovery=True)['imported']==0  # Discovery cannot undo deletion.
         # Verify kernel-enforced native-process cleanup (also applies to force-closing parent).
-        process=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],creationflags=subprocess.CREATE_NO_WINDOW)
+        from chatlocal.platform_process import owned_popen
+        process=owned_popen([sys.executable,'-c','import time;time.sleep(30)'],memory_bytes=2*1024**3)
         try:
             job=ChildJob(process);job.close();process.wait(timeout=3)  # Windows job close may report exit code 0.
         finally:

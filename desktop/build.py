@@ -41,9 +41,10 @@ def build_icon():
     canvas.save(icon,sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
     return icon
 
-def build(no_zip=False,qa=False,output=None,lite=False):
+def build(no_zip=False,qa=False,output=None,lite=False,bundle_snowluma=False):
     if not qa and subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
         raise RuntimeError('正式打包前请先提交 Git 修改；测试构建可用 --qa --no-zip。')
+    checkpoint=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     out=(Path(output) if output else ROOT/'release'/(VERSION+'-mcp' if lite else VERSION)/'Tulpa').resolve()
     assert out.is_relative_to((ROOT/'release').resolve()) and out.name=='Tulpa'
     out.mkdir(parents=True,exist_ok=True)
@@ -89,13 +90,20 @@ def build(no_zip=False,qa=False,output=None,lite=False):
         from lite_dependencies import copy_dependencies
         lite_deps=copy_dependencies(ROOT,copy)
     else:tree(site,'runtime/Lib/site-packages',lambda p:p.parts[0]=='pip' or p.parts[0].startswith('pip-') or p.name in ('direct_url.json',))
-    for name in (('chatlocal','web') if lite else ('chatlocal','web','harness')):tree(ROOT/name,name)
+    for name in (('chatlocal','web','tulpa_bilibili') if lite else ('chatlocal','web','harness')):tree(ROOT/name,name)
+    if bundle_snowluma:
+        # Include only the verified, uninitialized official archive. Never copy
+        # a user's live runtime/config, and never execute it while building.
+        from chatlocal.snowluma_download import ArchiveInstallation
+        from chatlocal.snowluma_managed import load_manifest
+        archive=ArchiveInstallation(load_manifest(),ROOT/'.cache/snowluma-package').archive(lambda:None)
+        copy(archive,Path('resources/snowluma')/archive.name)
     # Only tracked scripts: omit private probes and user chats in ignored paths.
     scripts=subprocess.check_output(['git','ls-files','scripts'],cwd=ROOT,text=True).splitlines()
-    source_only={'chat_adapter_fixture.py','prepare_reader_runtime.py','package_qq_source_fix.py','fix_qq_source.py',
+    source_only={'build_linux_release.py','chat_adapter_fixture.py','prepare_reader_runtime.py','package_qq_source_fix.py','fix_qq_source.py',
                  'napcat_qq_probe.py','napcat_qq_fixture.py','bench_napcat_qq_fixture.py'}
     for name in scripts:
-        if Path(name).suffix=='.py' and not Path(name).name.startswith(('check_','probe_')) and Path(name).name not in source_only:copy(ROOT/name,name)
+        if Path(name).suffix in ('.py','.html') and not Path(name).name.startswith(('check_','probe_')) and Path(name).name not in source_only:copy(ROOT/name,name)
     copy(ROOT/'scripts/reader_patches.py','scripts/reader_patches.py')
     copy(ROOT/'scripts/live_wechat.py','scripts/live_wechat.py')
     copy(ROOT/'scripts/qq_labels.py','scripts/qq_labels.py')
@@ -117,6 +125,11 @@ def build(no_zip=False,qa=False,output=None,lite=False):
     subprocess.run([sys.executable,str(ROOT/'scripts/check_live_runtime.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_qq_labels.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp.py'),'--package',str(out)],check=True)
+    if lite:
+        subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_bilibili.py'),'--package',str(out)],check=True)
+        subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_cli.py'),'--package',str(out)],check=True)
+        subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_history_optional.py'),'--package',str(out)],check=True)
+    subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_connection_ui.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_onebot.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_actions.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_chat.py'),'--package',str(out)],check=True)
@@ -127,6 +140,8 @@ def build(no_zip=False,qa=False,output=None,lite=False):
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_reactions.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_chat_turns.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_language_learning.py'),'--package',str(out)],check=True)
+    subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_multi_group_learning.py'),'--package',str(out)],check=True)
+    subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_jargon_pipeline.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_language_integration.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_auto_learning.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_expression_evidence.py'),'--package',str(out)],check=True)
@@ -134,7 +149,10 @@ def build(no_zip=False,qa=False,output=None,lite=False):
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_jargon_matching.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_snowluma_managed.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_snowluma_managed_transport.py'),'--package',str(out)],check=True)
+    subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_snowluma_download.py'),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_mcp_downloads.py'),'--package',str(out)],check=True)
+    for check in ('check_mcp_chat_enrichment.py','check_mcp_image_reuse.py'):
+        subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts'/check),'--package',str(out)],check=True)
     subprocess.run([str(out/'runtime/python.exe'),str(ROOT/'scripts/check_upgrade.py')],check=True)
     tree(ROOT/'tools/whispercpp/Release','tools/whispercpp/Release')
     model=ROOT/'.cache/voice-models/ggml-small-q5_1.bin'
@@ -177,27 +195,34 @@ def build(no_zip=False,qa=False,output=None,lite=False):
     if qa:cmd.insert(1,'/define:QA')
     if lite:cmd.insert(1,'/define:MCP_ONLY')
     subprocess.run(cmd,check=True)
+    if lite:
+        subprocess.run([str(csc),'/nologo','/target:exe','/platform:x64','/optimize+',f'/win32icon:{icon}',
+            f'/out:{register("Tulpa.CLI.exe")}', '/r:System.dll',str(ROOT/'desktop/CLI.cs')],check=True)
     subprocess.run([str(csc),'/nologo','/target:winexe','/platform:x64','/optimize+',f'/win32icon:{icon}',
         f'/out:{register("Tulpa.Support.exe")}', '/r:System.dll','/r:System.Core.dll','/r:System.Drawing.dll',
         '/r:System.Windows.Forms.dll','/r:System.Web.Extensions.dll',str(ROOT/'desktop/Support.cs')],check=True)
     copy(ROOT/'desktop/ChatWeave.exe.config',executable+'.config')
-    write('开始使用.txt', 'Tulpa '+VERSION+'\n\n完整解压此文件夹，双击 Tulpa.exe。无需安装 Python、Node 或运行 PowerShell。\n\n使用外部 Agent（例如 Codex）：\n1. 首次选择「连接外部 Agent」，无需模型 API Key。\n2. 在「数据与同步」登录并选择本机 QQ / 微信账号，导入需要的聊天。\n3. 打开「外部 Agent / MCP」，选择平台、会话、日期及可选权限，点击创建连接（可一并开启服务）。\n4. 点击检测连接，确认后写入本机 Codex 配置，或复制配置到其他支持 Streamable HTTP 的客户端。\n5. 在客户端重新连接 MCP。不要把 OneBot Token 当成 MCP Token。\n\n使用内置聊天：在「模型与连接」填写自己的模型 API 地址、API Key 和模型名称。\nOneBot 可独立保存并检测；MCP 与 QQ 扩展共用这份配置。SnowLuma 等接入服务仍需独立运行，本包不附带。\n\n勾选「关闭窗口后留在托盘」后，关闭窗口仍可提供 MCP 和实时读取。双击托盘图标打开，右键「彻底退出」停止服务；托盘菜单可选择开机启动（默认关闭）。不勾选时关闭窗口即退出。移动文件夹后请重新设置开机启动。\n数据和配置保存在本文件夹的 data、imports、.env 等位置。升级请先彻底退出并备份，保留个人数据；不要同时运行两个指向同一数据目录的版本。\n请放在有写入权限的本地目录，不要直接从 ZIP 内运行。Windows 10/11 x64，.NET Framework 4.8。\n本程序未签名。源码：https://github.com/fumingyang2004/Tulpa 。第三方许可见 doc/THIRD_PARTY.md，教程见 doc/MCP.md。\n')
+    write('开始使用.txt', 'Tulpa '+VERSION+'\n\n完整解压此文件夹，双击 Tulpa.exe。无需安装 Python、Node 或运行 PowerShell。\n\n使用外部 Agent（例如 Codex）：\n1. 首次选择「连接外部 Agent」，无需模型 API Key。\n2. 在「数据与同步」登录并选择本机 QQ / 微信账号，导入需要的聊天。\n3. 打开「外部 Agent / MCP」，选择平台、会话、日期及可选权限，点击创建连接（可一并开启服务）。\n4. 点击检测连接，确认后写入本机 Codex 配置，或复制配置到其他支持 Streamable HTTP 的客户端。\n5. 在客户端重新连接 MCP。不要把 OneBot Token 当成 MCP Token。\n\n使用内置聊天：在「模型与连接」填写自己的模型 API 地址、API Key 和模型名称。\nOneBot 可独立保存并检测；MCP 与 QQ 扩展共用这份配置。SnowLuma 可在 OneBot 设置中勾选协议后一键自动配置。\n\n勾选「关闭窗口后留在托盘」后，关闭窗口仍可提供 MCP 和实时读取。双击托盘图标打开，右键「彻底退出」停止服务；托盘菜单可选择开机启动（默认关闭）。不勾选时关闭窗口即退出。移动文件夹后请重新设置开机启动。\n数据和配置保存在本文件夹的 data、imports、.env 等位置。升级请先彻底退出并备份，保留个人数据；不要同时运行两个指向同一数据目录的版本。\n请放在有写入权限的本地目录，不要直接从 ZIP 内运行。Windows 10/11 x64，.NET Framework 4.8。\n本程序未签名。源码：https://github.com/fumingyang2004/Tulpa 。第三方许可见 doc/THIRD_PARTY.md，教程见 doc/MCP.md。\n')
     if lite:
-        write('开始使用.txt', 'Tulpa MCP '+VERSION+'\n\n完整解压后双击 Tulpa.exe。此版只提供本机资料服务与 MCP，不含内置模型、Gradio 或 DeepSeek Harness。\n1. 在数据与同步导入 QQ / 微信资料，可开启实时读取。\n2. 在连接外部 Agent 选择范围并创建凭据，连接 Codex、DeepSeek Harness 等 Streamable HTTP 客户端。\n3. OneBot 设置与完整版本相同。发送、群管理默认关闭；勾选对应权限后 Agent 可直接执行，无需逐次审批。可撤销连接，操作记录留在本机。\n4. Windows 10/11 x64，需要系统 Microsoft Edge WebView2 Evergreen Runtime。多数系统已安装；缺少时安装微软官方运行时：https://developer.microsoft.com/microsoft-edge/webview2/ 。\n5. 主包不带语音模型，首页可一键下载约 181 MB，安装后离线转写。Office 原文件通过 download_file 下载后交给外部 Agent；不附带 Office 解析框架或本地 OCR。\n6. 此压缩包不含任何聊天或凭据。数据与完整版本各自独立；不要同时打开两个指向同一数据目录的版本。\n教程：doc/MCP_LITE.md。\n')
+        write('开始使用.txt', 'Tulpa MCP '+VERSION+'\n\n完整解压后双击 Tulpa.exe。\n1. 点击“开始创建链接”，勾选 QQ、微信或哔哩哔哩及所需能力。名称可留空。\n2. QQ 卡片内可配置 SnowLuma；B站账号在左侧扫码登录。只有选中聊天记录读取但尚无资料时才会提示导入。\n3. 点击“一键开启 MCP”，复制连接配置到 Codex、DeepSeek Harness 等 Streamable HTTP 客户端。\n4. 首页链接列表可折叠，每条链接可单独启停或删除。左侧“QQ 学习管理”按 QQ 账号和群管理本地积累。\n5. Windows 10/11 x64，需要系统 Microsoft Edge WebView2 Evergreen Runtime。多数系统已安装；缺少时安装微软官方运行时：https://developer.microsoft.com/microsoft-edge/webview2/ 。\n6. 保留本安装内的人格、授权和学习库；不要同时打开两个指向同一数据目录的版本。\n界面说明：doc/MCP_CONNECTION_UI.md；功能教程：doc/MCP_LITE.md。\n')
     with (out/'开始使用.txt').open('a',encoding='utf-8') as guide:
-        guide.write('\nSnowLuma 自动配置：自行从官方页面下载并解压 Windows x64 完整版，在“连接外部 Agent → 准备资料 → 连接 QQ”输入文件夹路径，勾选授权，点击“载入并配置”。全新 v1.14.22 可自动初始化，已有配置可自动核对并导入；无需重复载入或手抄密码、端口、Token。本包不附带或下载 SnowLuma。完整步骤、取消与恢复说明见 doc/SNOWLUMA_MANAGED.md。\n')
+        if lite:guide.write('\n命令行：双击 Tulpa.CLI.exe，或在终端运行 .\\Tulpa.CLI.exe --json status。Agent 可用 connections、sl、bilibili、learning、tools、call 配置和调用；详见 doc/MCP_CLI.md。托盘菜单也可打开命令行。\n')
+        guide.write('\nSnowLuma 自动配置：在“开始创建链接 → QQ → QQ 连接”或左侧“OneBot 设置”勾选使用细则与自动配置授权，点击“一键配置”。Tulpa 校验随包运行文件或自动从官方渠道下载固定版本，然后自动配置端口、密码和 Token。只有多个 QQ 进程或尚未登录时需要选择账号或扫码。已有独立服务可从高级选项导入，完整步骤、取消与恢复说明见 doc/SNOWLUMA_MANAGED.md。\n')
         guide.write('\n从旧版本升级：先看 doc/UPGRADE.md。可将该文档交给 Codex 或 DeepSeek Harness，使用新版 scripts/upgrade_installation.py 更新原安装目录，自动保留聊天、附件、MCP 授权和实时进度，无需重新导入。升级前从托盘彻底退出 Tulpa。\n持续群聊和表情包仅向 MCP 开放：OneBot HTTP + 正向 WebSocket，按连接分别授权；完整步骤见 doc/MCP.md。\n')
     tree(ROOT/'desktop/licenses','licenses')
     for name in ('LICENSE','README.md'):
         copy(ROOT/name,name)
     docs=subprocess.check_output(['git','ls-files','doc'],cwd=ROOT,text=True).splitlines()
     for name in docs:
-        if Path(name).suffix=='.md' or (name.startswith('doc/assets/') and Path(name).suffix in ('.png','.svg')):
+        if Path(name).suffix=='.md' or name=='doc/licenses/SL_LICENSE.txt' or (name.startswith('doc/assets/') and Path(name).suffix in ('.png','.svg')):
             copy(ROOT/name,name)
     # Only aggregate versions/hashes. Never environment variables or source data.
     import importlib.metadata
     dependencies=lite_deps if lite else sorted([dict(name=d.metadata['Name'],version=d.version) for d in importlib.metadata.distributions() if d.metadata['Name']],key=lambda d:d['name'].lower())
-    manifest=dict(product='Tulpa',version=VERSION,platform='windows-x64',checkpoint=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+    if not qa and (subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip() or
+                   subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()!=checkpoint):
+        raise RuntimeError('源码在构建期间改变；请在同一干净提交重新打包，未生成发布归档。')
+    manifest=dict(product='Tulpa',version=VERSION,platform='windows-x64',checkpoint=checkpoint,working_tree_overlay=bool(qa),
                   edition='mcp' if lite else 'full',assets=HASHES,dependencies=dependencies,files=sorted(entries),
                   file_sha256={rel:digest(out/rel) for rel in sorted(entries)})
     write('build-manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
@@ -223,4 +248,4 @@ def build(no_zip=False,qa=False,output=None,lite=False):
         print(f'ZIP {archive.name}: {archive.stat().st_size:,} bytes; SHA256 {sha}',flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--no-zip',action='store_true');p.add_argument('--qa',action='store_true');p.add_argument('--mcp-only',action='store_true');p.add_argument('--output');args=p.parse_args();build(args.no_zip,args.qa,args.output,args.mcp_only)
+    p=argparse.ArgumentParser();p.add_argument('--no-zip',action='store_true');p.add_argument('--qa',action='store_true');p.add_argument('--mcp-only',action='store_true');p.add_argument('--bundle-snowluma',action='store_true');p.add_argument('--output');args=p.parse_args();build(args.no_zip,args.qa,args.output,args.mcp_only,args.bundle_snowluma)

@@ -3,7 +3,7 @@
   // Both settings entrances share one in-page operation. Credentials and durable
   // authorization stay on the server; browser drafts do not grant MCP access.
   const views=new Set(),draft={folder:'',accepted:false,busy:false,notice:'',refreshError:'',current:null,
-    selection:null,account:'',http:'',ws:'__choose__',qq:'',imported:false};
+    selection:null,account:'',http:'',ws:'__choose__',qq:'',imported:false,manual:false};
   let timer=null,refreshing=null,revision=0,lastReady=false;
   const emit=()=>{for(const view of views)view.render();};
   async function request(action='',body){
@@ -88,9 +88,15 @@
     if(data.saved){draft.imported=true;clearSelection();await saved(data.settings);}
   }
   async function connect(){
-    if(draft.busy||!draft.folder.trim()||!draft.accepted||draft.current?.enabled||draft.imported)return;
+    const automatic=draft.current?.automatic_available&&!draft.manual;
+    if(draft.busy||(!automatic&&!draft.folder.trim())||!draft.accepted||draft.current?.enabled||draft.imported)return;
     await run(async()=>{
       if(!await checkConsent())return;
+      if(automatic){
+        clearSelection();draft.notice='正在自动部署并连接 QQ…';emit();
+        const s=await request('managed/automatic',{accepted:true,fingerprint:draft.current.consent_fingerprint});
+        draft.notice='';receive(s);return;
+      }
       clearSelection();draft.notice='正在检查 SnowLuma 文件夹…';emit();
       const preview=await request('managed/inspect',{folder:draft.folder.trim()});
       draft.folder=preview.folder;
@@ -119,10 +125,9 @@
   function mount(host,{prefix,onSaved=async()=>{}}={}){
     const id=name=>'snow-managed-'+prefix+'-'+name,el=name=>document.getElementById(id(name));
     host.classList.add('snowluma-setup','snow-managed');
-    host.innerHTML=`<h3>连接 QQ</h3><p>自行下载并解压 <a href="https://github.com/SnowLuma/SnowLuma/releases/tag/v1.14.22" target="_blank" rel="noopener noreferrer">SnowLuma Windows x64 完整版</a>。输入路径、勾选授权，再点击“载入并配置”即可。</p>
-      <label for="${id('folder')}">SnowLuma 文件夹</label><div class="snow-folder"><input id="${id('folder')}" type="text" maxlength="2048" placeholder="粘贴已解压的 SnowLuma 文件夹路径" spellcheck="false"><button id="${id('browse')}" type="button">选择文件夹</button></div>
-      <label class="desktop-check"><input id="${id('consent')}" type="checkbox">同意 SnowLuma 使用细则，并自动配置和连接 QQ</label>
-      <div class="snow-managed-actions"><button id="${id('start')}" type="button" class="primary-button" disabled>载入并配置</button><button id="${id('retry')}" type="button" hidden>重试</button><button id="${id('cancel')}" type="button" hidden>取消本次接入</button><button id="${id('revoke')}" type="button" hidden>撤销自动配置授权</button></div>
+    host.innerHTML=`<h3>SnowLuma</h3>
+      <label class="desktop-check"><input id="${id('consent')}" type="checkbox">同意 SnowLuma 使用细则和隐私政策，授权自动部署、配置和连接 QQ</label>
+      <div class="snow-managed-actions"><button id="${id('start')}" type="button" class="primary-button" disabled>一键配置</button><button id="${id('retry')}" type="button" hidden>重试</button><button id="${id('cancel')}" type="button" hidden>取消本次接入</button><button id="${id('revoke')}" type="button" hidden>撤销自动配置授权</button></div>
       <p id="${id('status')}" role="status" aria-live="polite"></p>
       <div id="${id('existing')}" hidden><label for="${id('account')}">QQ 账号</label><select id="${id('account')}"></select>
         <label for="${id('http')}">HTTP 服务节点</label><select id="${id('http')}"></select>
@@ -130,9 +135,14 @@
         <p id="${id('preview')}" class="snow-preview"></p><button id="${id('apply')}" type="button">确认并连接</button></div>
       <div id="${id('selection')}" hidden><label for="${id('qq')}">选择要连接的 QQ 进程</label><select id="${id('qq')}"></select><button id="${id('select')}" type="button">连接所选 QQ</button><small>账号待验证表示尚不能确认登录 QQ 号；连接后仍会核对。</small></div>
       <details><summary>协议与自动配置说明</summary><div id="${id('agreements')}"></div>
-        <p>无需填写端口、Token 或管理密码。仅使用你选择的本地文件夹，不下载或复制 SnowLuma。新目录先备份，再初始化随机密码及独立 HTTP / WS Token，仅监听本机。只有一个 QQ 进程时自动连接，多个时由你选择。</p>
+        <p>使用经过核对的固定版本，优先校验随包运行文件，否则从官方 GitHub 下载并核对 SHA256，再部署到 Tulpa 私有目录。不会静默追随最新版。协议或操作范围变化时重新征求同意。</p>
+        <p>自动初始化随机管理密码及独立 HTTP / WS Token，仅监听本机。只有一个 QQ 进程时自动连接，多个时由你选择；未登录时只需在 QQ 完成登录。不会自动连接全部 QQ 进程。</p>
         <p>已有连接自动检测并导入，保留原密码和节点，不接管或关闭外部服务。不会增加 Agent 权限，也不影响聊天、人格及学习记录。</p>
         <p id="${id('security')}"></p><p id="${id('consent-at')}"></p></details>
+      <details id="${id('manual-options')}"><summary>高级：使用已有 SnowLuma</summary>
+        <label class="desktop-check"><input id="${id('manual')}" type="checkbox">使用我已有的 SnowLuma 文件夹</label>
+        <label for="${id('folder')}">SnowLuma 文件夹</label><div class="snow-folder"><input id="${id('folder')}" type="text" maxlength="2048" placeholder="粘贴已解压的 SnowLuma 文件夹路径" spellcheck="false"><button id="${id('browse')}" type="button">选择文件夹</button></div>
+        <small>已有独立服务只核对并导入连接，不重置密码或关闭服务。填写后仍点击上方同一个配置按钮。</small></details>
       <details><summary>高级诊断与恢复</summary><p id="${id('diagnostics')}"></p><p>失败不会覆盖有效连接。恢复整个 Tulpa 备份前请先退出程序。撤销自动配置授权只停止 Tulpa 自己启动的服务，保留 QQ 和已有外部服务。</p></details>`;
     const nativePicker=Boolean(window.TULPA_FOLDER_PICKER&&window.chrome?.webview);
     let pendingPicker=null,dead=false;
@@ -150,14 +160,19 @@
     function render(){
       if(dead)return;
       const s=draft.current||{},locked=draft.busy||Boolean(s.enabled);
+      const automatic=Boolean(s.automatic_available)&&!draft.manual;
+      el('manual').checked=draft.manual||!s.automatic_available;
+      el('manual').disabled=locked||!s.automatic_available;
+      if(s.available&&!s.automatic_available)el('manual-options').open=true;
       if(el('folder').value!==draft.folder)el('folder').value=draft.folder;
-      el('folder').disabled=el('browse').disabled=locked;
-      el('consent').checked=draft.accepted;
-      el('consent').disabled=locked||!s.available||!draft.folder.trim();
-      el('start').disabled=locked||!s.available||!draft.accepted||!draft.folder.trim()||draft.imported||Boolean(draft.selection);
-      el('start').textContent=draft.busy?'正在载入并配置…':draft.imported?'已载入配置':s.enabled?(s.qq_ready?'QQ 已连接':'自动配置进行中'):'载入并配置';
+      el('folder').disabled=el('browse').disabled=locked||automatic;
+      el('consent').checked=draft.accepted||Boolean(s.enabled&&s.consent_current);
+      el('consent').disabled=locked||!s.available||(!automatic&&!draft.folder.trim());
+      el('start').disabled=locked||!s.available||!draft.accepted||(!automatic&&!draft.folder.trim())||draft.imported||Boolean(draft.selection);
+      el('start').textContent=draft.busy?'正在配置…':draft.imported?'已载入配置':s.enabled?(s.qq_ready?'QQ 已连接':s.phase==='error'?'接入未完成':s.phase==='stopped'?'托管服务已停止':'自动配置进行中'):automatic?'一键配置':'载入并配置';
       el('status').textContent=draft.refreshError||draft.notice||((s.enabled||!['idle',undefined].includes(s.phase))?
         (s.phase_label||'')+(s.account?' · QQ '+s.account:'')+(s.message?'。'+s.message:''):'');
+      if(s.phase==='downloading'&&s.progress?.total)el('status').textContent+=' '+Math.floor(100*(s.progress.downloaded||0)/s.progress.total)+'%';
       el('retry').hidden=!s.available||!['error','cancelled','stopped'].includes(s.phase)||!s.consent_current;
       el('cancel').hidden=!s.enabled||['ready','error','revoked','stopped'].includes(s.phase);
       el('revoke').hidden=!(s.has_consent??s.consent_current);
@@ -183,7 +198,7 @@
       for(const d of s.agreements||[]){
         let url;try{url=new URL(d.url);}catch{continue;}
         if(url.origin!=='https://github.com'||!url.pathname.startsWith('/SnowLuma/SnowLuma/'))continue;
-        const p=document.createElement('p'),a=document.createElement('a');a.href=url.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=d.title+' · '+(d.version||s.version);
+        const p=document.createElement('p'),a=document.createElement('a');a.href=url.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=d.title+(d.version?' · 协议 '+d.version:' · 适用 SnowLuma '+s.version);
         p.append(a,document.createTextNode(' · SHA256 '+d.sha256));el('agreements').append(p);
       }
       el('diagnostics').textContent=['自动初始化支持 SnowLuma '+(s.version||''),s.code?'状态码：'+s.code:'',s.folder?'运行目录：'+s.folder:'',s.storage?'本机凭据与进度：'+s.storage:'',s.service_pid?'服务 PID：'+s.service_pid:'',s.qq_pid?'QQ PID：'+s.qq_pid:''].filter(Boolean).join('\n');
@@ -197,6 +212,7 @@
     }
     if(nativePicker)window.chrome.webview.addEventListener('message',picked);
     el('start').onclick=()=>void connect();
+    el('manual').onchange=()=>{draft.manual=el('manual').checked;draft.accepted=false;draft.imported=false;draft.notice='';revision++;clearSelection();emit();};
     el('account').onchange=()=>{chooseAccount(el('account').value);emit();};
     for(const kind of ['http','ws'])el(kind).onchange=()=>{draft[kind]=el(kind).value;emit();};
     el('apply').onclick=()=>void run(async()=>{if(await checkConsent())await importSelected();});

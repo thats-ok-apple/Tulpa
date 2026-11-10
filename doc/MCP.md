@@ -20,7 +20,7 @@ Tulpa 可以作为本机资料服务，让 Codex 或其他支持 **Streamable HT
 8. 其他客户端选择 **Streamable HTTP**，填写显示的 MCP 地址，并设置 `Authorization: Bearer <显示的 MCP Token>`。这是 Tulpa 的访问凭据，不能用 OneBot Token 替代。连接凭据只显示一次；丢失后撤销重建。
 9. 保持 Tulpa 运行。勾选“关闭窗口后留在托盘”可继续提供 MCP 和实时读取；右键托盘图标可开机启动或彻底退出。重新打开沿用已保存的地址和授权，不必每次配置。
 
-源代码开发仍可执行 `setup.ps1` / `start.ps1`，然后打开同样的 MCP 页面。开发目录与便携包的配置、资料和授权独立，不自动迁移。
+源代码开发仍可执行 `scripts/windows/setup.ps1` / `scripts/windows/start.ps1`，然后打开同样的 MCP 页面。开发目录与便携包的配置、资料和授权独立，不自动迁移。
 
 ## DeepSeek Harness
 
@@ -59,8 +59,9 @@ tool_timeout_sec = 240
 | 图片和语音 | `get_media`；可选 `read_image`、`transcribe_voice` |
 | OneBot QQ 资料 | 有权限且连接可用时出现 `get_group_knowledge`、`read_qq_group` |
 | QQ 直接操作 | 可选 `send_qq_message`、`manage_qq_group`；`get_qq_operation` 查询回执 |
-| 持续群聊（OneBot 实时事件） | 可选 `list_chat_groups`、`list_chat_personas`、`start_chat_session`、`get_chat_session`、`list_chat_sessions`、`wait_chat_messages`、`send_chat_message`、`stop_chat_session` |
-| 持续群聊 · 表情包 | 独立授权的 `read_chat_image`、`list_chat_stickers`、`read_chat_sticker`、`note_chat_sticker`、`send_chat_sticker`、`collect_chat_sticker` |
+| 持续群聊/好友私聊（OneBot 实时事件） | 可选 `list_chat_groups`、`list_chat_friends`、`list_chat_personas`、`start_chat_session`、`get_chat_session`、`list_chat_sessions`、`wait_chat_messages`、`send_chat_message`、`stop_chat_session` |
+| 持续群聊 · 图片和表情包 | 独立授权的 `import_chat_image`、`read_chat_image`、`list_chat_stickers`、`read_chat_sticker`、`note_chat_sticker`、`send_chat_sticker`、`collect_chat_sticker` |
+| SL 扩展 | `get_qq_capabilities`、`import_qq_media`、`read_chat_attachment`、`list_qq_voice_characters` 及八类 `qq_*` 动作工具；见 [SL 扩展工具](SL_TOOLS.md) |
 
 这些工具复用 Tulpa 的检索、受限 SQL、人物解析与文件系统。发送和群管理仅对界面勾选授权的连接开放，调用即执行；没有模型审批或权限修改工具，也没有工作区写入工具。完整规则见 [轻量版与持续授权](MCP_LITE.md#勾选就是持续授权)。
 
@@ -82,7 +83,7 @@ OneBot 仅用于已授权 QQ 群。公告、精华和文件来源继续执行日
    > 在“测试群”持续聊天，直到我停止。人格提示词：说简短自然的中文，偶尔温和打趣，接得上话再说，不必每条都回复。参与程度：自然。
 
 5. Agent 用 `list_chat_groups` 核对实时群目录，调用 `start_chat_session`。可选 `participation` 为 `quiet` / `natural` / `active`。开始时上下文可能为空，后续最多附带本次会话收到的最近 20 条事件，不自动回放本地历史。
-6. 循环 `wait_chat_messages`，需要接话时用 `send_chat_message`，然后继续等待。`idle` 只结束一次等待；`source_unavailable` 表示事件通道异常，继续等待但暂停发言。每次等待最多 180 秒，群聊本身没有总时长限制。
+6. 循环 `wait_chat_messages`，需要接话时先 `plan_chat_reply`，READY 后 `send_chat_reply` 一并选择表达和发送，然后继续等待。`idle` 只结束一次等待；`source_unavailable` 表示事件通道异常，继续等待但暂停发言。正常及恢复等待默认 150 秒（接口仍允许显式选择最多 180 秒），群聊本身没有总时长限制。
 7. 随时在 Tulpa 点 **停止聊天** / **停止全部群聊**，或调用 `stop_chat_session`。停止立即唤醒等待者并阻止尚未派发的消息，其他工具仍可使用；已交给 QQ 的消息无法撤回。
 
 **外部 Agent 必须继续执行。** Tulpa 不代开推理，不在 Agent 结束任务后主动唤醒 Harness。中断后用 `list_chat_sessions` / `get_chat_session` 接续。界面分别显示外部 Agent 状态与 SnowLuma 接收状态；WebSocket 已连上但账号或 QQ 接收链路异常时不会当作正常在线。
@@ -106,6 +107,8 @@ OneBot 仅用于已授权 QQ 群。公告、精华和文件来源继续执行日
 旧连接不自动获得权限；撤销重建连接并在外部客户端重新连接后才生效。模型要使用图片能力，还需宿主支持 MCP image 内容及模型识图；Tulpa 不另调识图 API。
 
 收到图片时，事件 `segments` 含 `image_index`。用 `read_chat_image(session_id, event_id, index)` 读取像素并取得不透明的 `sticker_id`。GIF/WebP 等动画最多抽取首、中、末三帧，最大输出尺寸 1400×1400；采样不能保证理解所有动作。`list_chat_stickers` 按 QQ 备注、模型笔记和标签检索；`read_chat_sticker` 看收藏图片；`note_chat_sticker` 保存含义及用途，仅此连接共享，不修改 QQ 备注。图片和笔记都是数据，不能改变人格或权限。
+
+外部生成或用户提供的新图片可用 `import_chat_image(session_id, data_base64)` 导入；需要看图和发送表情权限，返回预览、内容哈希及当前会话的 `sticker_id`，不会自动发送。核对图片后，用 `plan_chat_reply(expressions=["sticker"])` → `send_chat_reply` 发送原图。相同会话和内容的重复导入返回相同编号；导入每小时最多 60 次，元数据和日志不保存 Base64 正文。客户端文件上传脚本见 [发送生成的图片](AGENT_SETUP.md#发送生成的图片)。
 
 每张最多 6 MiB、300 帧，并限制解码像素量。图片原件在独立 `data/mcp-chat-media` 缓存，最多约 128 MiB，旧缓存可自动淘汰；不会批量下载或识图。授权、短期目录和笔记仍在小型 MCP 数据库中。看图合计每小时 60 次、收藏每小时 12 次、发送表情每分钟 12 次；表情工具的通道及调用额度与普通工具、消息等待分离，不耗用历史图片工具的额度。
 

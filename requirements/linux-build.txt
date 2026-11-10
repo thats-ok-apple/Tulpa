@@ -1,0 +1,4 @@
+# Only installed by the explicit voice installer if a C/C++ toolchain is absent.
+cmake==4.4.4
+ninja==1.13.2
+ziglang==0.15.2

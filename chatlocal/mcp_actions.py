@@ -1,4 +1,5 @@
 """Direct QQ operations under explicit UI grants, with durable no-retry receipts."""
+from . import reply_timing as timing
 import hashlib
 import json
 import threading
@@ -56,6 +57,7 @@ class MCPActions:
             raise ValueError('目标不在连接允许的会话和日期范围内。')
         return dict(row)
 
+    @timing.stage('operation.prepare')
     def prepare(self, grant, cid, kind, params, *, target_resolver=None, send_preparer=None):
         row = (target_resolver or self.scoped_target)(grant, cid, kind)
         if kind == 'send':
@@ -101,13 +103,17 @@ class MCPActions:
             rows = db.execute('SELECT o.id,g.name FROM operations o JOIN grants g ON o.grant_id=g.id ORDER BY o.created DESC LIMIT 100').fetchall()
         return [dict(self.get(r['id']), connection_name=r['name']) for r in rows]
 
+    @timing.stage('operation.execute')
     def execute(self, grant, kind, args, cancel, *, guard=None, target_resolver=None, send_preparer=None):
         cid, key = args['conversation_id'], args['idempotency_key']
         params = {k:v for k,v in args.items() if k not in ('conversation_id','idempotency_key')}
         signature = hashlib.sha256(dump([kind,cid,params]).encode()).hexdigest()
+        lock_started=time.monotonic()
         with _execution:
+            timing.note(operation_lock_wait_seconds=round(time.monotonic()-lock_started,6))
             if guard:guard()
-            grant = self.access.by_id(grant['id'], source=target_resolver is None)
+            self.access.ensure_revision(grant)
+            self.access.by_id(grant['id'], source=target_resolver is None)
             (target_resolver or self.scoped_target)(grant,cid,kind)
             with self.access.connect() as db:
                 old = db.execute('SELECT * FROM operations WHERE grant_id=? AND request_key=?', (grant['id'],key)).fetchone()
@@ -117,10 +123,12 @@ class MCPActions:
                 return self.get(old['id'], grant['id'])
             prepared, summary, target = self.prepare(grant, cid, kind, params, target_resolver=target_resolver, send_preparer=send_preparer)
             self.access.by_id(grant['id'], source=target_resolver is None)
+            self.access.ensure_revision(grant)
             if guard:guard()
             if cancel.is_set():
                 raise ValueError('调用已取消，未执行操作。')
             oid, now = uuid.uuid4().hex, time.time()
+            timing.note(operation_id=oid)
             with self.access.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 db.execute('INSERT INTO operations(id,grant_id,request_key,signature,kind,conversation_id,params,target,summary,state,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -129,6 +137,7 @@ class MCPActions:
             dispatched = False
             try:
                 self.access.by_id(grant['id'], source=target_resolver is None)
+                self.access.ensure_revision(grant)
                 if guard:guard()
                 if cancel.is_set():raise ValueError('调用已取消，未执行。')
                 if kind=='send':

@@ -1,7 +1,9 @@
 """Real MCP HTTP client + isolated source fixtures; never sends QQ messages."""
 import asyncio
+import base64
 import io
 import json
+import logging
 import socket
 import sys
 import tempfile
@@ -15,6 +17,7 @@ ROOT = Path(sys.argv[sys.argv.index('--package')+1]).resolve() if '--package' in
 (ROOT/'.tmp').mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT))
 import httpx
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mcp import ClientSession
@@ -66,7 +69,7 @@ async def protocol(url, first, second, ui, service, store, folder):
         assert len(other['messages'])==1 and other['messages'][0]['platform']=='wechat'
         assert not (await call(b,'search_messages', {'query':'课程设计'}))['messages']
         sql = await call(a, 'query_communication_db', {'sql':'SELECT count(*) FROM agent_messages'})
-        assert sql['rows']==[[520]], sql
+        assert sql.get('rows')==[[520]], sql
         assert (await call(a, 'query_communication_db', {'sql':"ATTACH DATABASE '.env' AS bad"})).get('error')
         assert (await call(a, 'workspace_draft', {})).get('error')
         assert (await call(a, 'read_conversation', {'platform':'qq','conversation_id':'course','limit':1000})).get('error')
@@ -165,16 +168,75 @@ async def optional_tools(url, service, store, folder):
     frames[0].save(pixels,format='GIF',save_all=True,append_images=frames[1:],duration=100)
     with patch.object(media,'DATA',folder):
         cached=media.cache_image(pixels.getvalue())
-        with store.connect() as db:db.execute('UPDATE messages SET media_json=? WHERE id=?',(json.dumps([cached]),mids[0]))
+        with store.connect() as db:
+            db.execute('UPDATE messages SET media_json=? WHERE id=?',(json.dumps([cached]),mids[0]))
+            db.execute('UPDATE messages SET media_json=? WHERE id=?',(json.dumps([media.unavailable()]),mids[1]))
+            from chatlocal.image_index import ENGINE
+            cursor=db.execute("INSERT INTO image_ocr(message_id,image_index,digest,engine,status,text,confidence) VALUES(?,?,?,?,?,?,?)",
+                (mids[0],0,cached['sha256'],ENGINE,'ready','MCP_OCR_ONLY_731',.95))
+            db.execute('INSERT INTO image_ocr_fts(rowid,terms) VALUES(?,?)',(cursor.lastrowid,'MCP_OCR_ONLY_731'))
         with patch.object(service.tools,'onebot',return_value=QQ()):
             async with client(url,token) as c:
                 names={s.name for s in (await c.list_tools()).tools}
                 assert {'read_image','prepare_file','transcribe_voice','get_group_knowledge','read_qq_group'}<=names
                 assert 'qq_group_admin' not in names
                 result=await c.call_tool('read_image',dict(message_id=mids[0]))
-                assert len([b for b in result.content if b.type=='image'])==3, result
+                image_blocks=[b for b in result.content if b.type=='image']
+                assert len(image_blocks)==3, result
                 assert result.structuredContent['total_frames']==5
+                assert result.structuredContent['frame_indices']==[0,2,4]
+                for block, expected in zip(image_blocks, ('red','blue','purple')):
+                    assert block.mimeType=='image/jpeg'
+                    with Image.open(io.BytesIO(base64.b64decode(block.data, validate=True))) as decoded:
+                        assert decoded.format=='JPEG' and decoded.size==(16,16)
+                        actual=decoded.convert('RGB').getpixel((8,8))
+                        target=Image.new('RGB',(1,1),expected).getpixel((0,0))
+                        assert max(abs(a-b) for a,b in zip(actual,target))<8, (actual,target)
+                missing=await c.call_tool('read_image',dict(message_id=mids[1]))
+                assert missing.isError and missing.structuredContent['error_code']=='media_unavailable', missing
+                assert not any(b.type=='image' for b in missing.content)
+                # A delayed QQ file must become readable on demand, even when
+                # the persisted retry queue is backing off for an hour.
+                from chatlocal import image_recheck,sync
+                import hashlib
+                png=io.BytesIO();Image.new('RGB',(20,12),'red').save(png,format='PNG')
+                digest=hashlib.md5(png.getvalue()).hexdigest()
+                descriptor=dict(media.unavailable(reason_code='source_missing',md5=digest,filename=digest+'.png'),source_index=7)
+                source=folder/'qq-account/nt_db';source.mkdir(parents=True)
+                recheck_data=folder/'recheck-data';recheck_data.mkdir()
+                (recheck_data/'qq-snapshot-info.json').write_text(json.dumps(dict(account='111',source=str(source))))
+                with store.connect() as db:
+                    db.execute('UPDATE messages SET media_json=? WHERE id=?',(json.dumps([descriptor]),mids[1]))
+                (recheck_data/'.tmp').mkdir()
+                with patch.object(image_recheck,'DATA',recheck_data),patch.object(sync,'ROOT',recheck_data):
+                    before=await c.call_tool('read_image',dict(message_id=mids[1],index=7))
+                    assert before.isError and before.structuredContent.get('reason_code')=='source_missing',before
+                    target=source.parent/'nt_data/Pic/2026-10/Ori'/ (digest+'.png')
+                    target.parent.mkdir(parents=True);target.write_bytes(png.getvalue())
+                    after=await c.call_tool('read_image',dict(message_id=mids[1],index=7))
+                    assert not after.isError and any(b.type=='image' for b in after.content),after
+                    with store.connect() as db:
+                        saved=json.loads(db.execute('SELECT media_json FROM messages WHERE id=?',(mids[1],)).fetchone()[0])
+                    assert saved[0]['status']=='available' and saved[0]['source_index']==7
+                    with store.connect() as db:
+                        db.execute("INSERT OR REPLACE INTO client_settings VALUES('image_remote',?)",
+                            (json.dumps(dict(enabled=False,on_demand=True)),))
+                        db.execute('UPDATE messages SET media_json=? WHERE id=?',(json.dumps([descriptor]),mids[1]))
+                    files_before=set((folder/'media').rglob('*'))
+                    once=await c.call_tool('read_image',dict(message_id=mids[1],index=7))
+                    assert not once.isError and len([b for b in once.content if b.type=='image'])==1,once
+                    assert store.message(mids[1])['media'][0]['status']=='unavailable'
+                    assert files_before==set((folder/'media').rglob('*')) and target.is_file()
+                    mismatch=await c.call_tool('read_image',dict(message_id=mids[1],index=7,conversation_id='wrong'))
+                    assert mismatch.isError and not any(b.type=='image' for b in mismatch.content)
                 assert (await c.call_tool('read_image',dict(message_id=521))).isError
+                ocr=(await c.call_tool('search_messages',dict(query='MCP_OCR_ONLY_731',search_source='image_ocr'))).structuredContent
+                assert ocr['hit_ids']==[mids[0]],ocr
+                assert next(m for m in ocr['messages'] if m['id']==mids[0])['image_text'][0]['index']==0
+                assert not (await c.call_tool('search_messages',dict(query='MCP_OCR_ONLY_731',search_source='text'))).structuredContent['messages']
+                no_media=service.access.create(dict(base,name='OCR denied',media=False))['token']
+                async with client(url,no_media) as denied:
+                    assert not (await denied.call_tool('search_messages',dict(query='MCP_OCR_ONLY_731'))).structuredContent['messages']
                 knowledge=(await c.call_tool('get_group_knowledge',dict(group_id=cid))).structuredContent
                 assert 'entries' in knowledge, knowledge
                 assert len(knowledge['entries'])==1 and '课程设计报告' in knowledge['entries'][0]['content'],knowledge
@@ -215,10 +277,31 @@ def main():
         path=folder/'messages.json';path.write_text(json.dumps(rows,ensure_ascii=False),'utf-8');store.import_file(path)
         layer=Artifacts(store);layer._roots=lambda p:[folder];layer.prepare(1);layer.prepare(2)
         app=FastAPI();service=install_mcp_routes(app,store)
+        uvicorn.Config(app,log_level='info',access_log=False)
+        loggers=[logging.getLogger(name) for name in ('uvicorn','uvicorn.error','uvicorn.access','uvicorn.asgi')]
+        def logging_state():return [(l.level,l.getEffectiveLevel(),tuple(l.handlers),l.propagate,l.disabled) for l in loggers]
+        web_logging=logging_state()
+        assert logging.getLogger('uvicorn.error').isEnabledFor(logging.INFO)
         with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         ui_headers={'X-ChatWeave-UI':'1','Origin':'http://testserver'}
         with TestClient(app) as ui:
             assert not ui.get('/api/mcp').json()['enabled']
+            from chatlocal.onebot import Client
+            with patch.object(Client,'login',return_value='111'), patch.object(Client,'call') as catalog, \
+                 patch('chatlocal.onebot.configuration',return_value={'url':'http://127.0.0.1:9','token':'catalog-fixture'}):
+                catalog.return_value=[dict(group_id=222,group_name='Current group'),dict(group_id='invalid')]
+                groups=ui.get('/api/mcp/live-groups').json()['items']
+                catalog.assert_called_once_with('get_group_list',{'no_cache':True})
+                assert [r['conversation_id'] for r in groups]==['111:group:222']
+                catalog.reset_mock()
+                catalog.return_value=[dict(user_id=333,remark='Friend remark',nickname='Nickname'),dict(user_id=444,nickname='Other friend'),dict(user_id='invalid')]
+                friends=ui.get('/api/mcp/live-friends').json()['items']
+                catalog.assert_called_once_with('get_friend_list',{})
+                assert [(r['conversation_id'],r['name']) for r in friends]==[('111:direct:333','Friend remark'),('111:direct:444','Other friend')]
+                assert ui.get('/api/mcp/live-friends',headers={'Origin':'https://evil.invalid'}).status_code==403
+                catalog.side_effect=ValueError('OneBot unavailable')
+                assert ui.get('/api/mcp/live-friends').status_code==400
+            assert ui.get('/api/mcp/conversations?query=course').json()['items'][0]['conversation_id']=='course'
             assert ui.put('/api/mcp',json=dict(enabled=True,port=port)).status_code==403
             assert ui.get('/api/mcp',headers={'Host':'evil.invalid'}).status_code==403
             base=dict(name='Fixture A',platforms=['qq'],conversations=[['qq','course']],start='2026-10-01',end='',media=False,prepare=False,voice=False,onebot=False)
@@ -227,6 +310,7 @@ def main():
             second=ui.post('/api/mcp/connections',json=dict(base,name='Fixture B',platforms=['wechat'],conversations=[['wechat','private']]),headers=ui_headers).json()['token']
             settings=ui.put('/api/mcp',json=dict(enabled=True,port=port),headers=ui_headers).json()
             assert settings['running'], settings
+            assert logging_state()==web_logging, 'MCP startup overwrote WebUI logging'
             # A second process cannot silently take over this server's port.
             from chatlocal.mcp_server import MCPService
             rival=MCPService(service.access);rival.start()
@@ -257,6 +341,24 @@ def main():
                 try:install_codex(settings['url'],second,home=home);raise AssertionError('Existing entry overwritten')
                 except ValueError:pass
                 assert config.read_bytes()==saved
+                # A second grant can use a separate name without replacing tulpa.
+                second_route='/api/mcp/connections/'+service.access.authorize(second)['id']+'/codex'
+                named={'token':second,'server_name':'tulpa_wechat'}
+                assert ui.post(second_route,json=named,headers=ui_headers).json()['changed']
+                assert not ui.post(second_route,json=named,headers=ui_headers).json()['changed']
+                parsed=tomllib.loads(config.read_text('utf-8'))
+                assert parsed['mcp_servers']['tulpa']['http_headers']['Authorization']=='Bearer '+first
+                assert parsed['mcp_servers']['tulpa_wechat']['http_headers']['Authorization']=='Bearer '+second
+                saved=config.read_bytes()
+                conflict=ui.post(route,json={'token':first,'server_name':'tulpa_wechat'},headers=ui_headers)
+                assert conflict.status_code==409 and 'tulpa_wechat' in conflict.json()['detail']
+                for invalid in ('','with space','nested.name','x]\n[other',None,12,'a'*65):
+                    assert ui.post(route,json={'token':first,'server_name':invalid},headers=ui_headers).status_code==409
+                assert ui.post(route,json={'token':first,'server_name':'valid','extra':True},headers=ui_headers).status_code==400
+                assert config.read_bytes()==saved
+                from chatlocal.mcp_connect import codex_config
+                entries=tomllib.loads(codex_config(settings['url'],'fixture',{'send':True,'chat':True,'chat_images':True},server_name='tulpa-qq_2'))['mcp_servers']
+                assert set(entries)=={'tulpa-qq_2'} and 'send_qq_message' in entries['tulpa-qq_2']['tools']
             asyncio.run(protocol(settings['url'],first,second,ui,service,store,folder))
             value=ui.get('/api/mcp').json();assert first not in json.dumps(value) and second not in json.dumps(value)
             assert value['recent'] and not any('content' in r for r in value['recent'])
@@ -271,8 +373,15 @@ def main():
             except ValueError:pass
             asyncio.run(optional_tools(settings['url'],service,store,folder))
             # Restart reuses durable settings and grants without widening scope.
-            service.stop();service.start()
-            assert service.status()['running'] and service.access.authorize(second)['id']==gid
+            with httpx.Client(trust_env=False) as keepalive:
+                if not hasattr(socket,'SO_EXCLUSIVEADDRUSE'):
+                    # Keep a client open so server shutdown reliably creates
+                    # POSIX TIME_WAIT; repeated starts must not report port theft.
+                    assert keepalive.get(settings['url']).status_code==401
+                service.stop();service.start()
+                assert service.status()['running'],service.status()
+                assert service.access.authorize(second)['id']==gid
+            assert logging_state()==web_logging, 'MCP restart overwrote WebUI logging'
             assert ui.put('/api/mcp',json=dict(enabled=False,port=port),headers=ui_headers).json()['running'] is False
         assert not service.thread
     print('PASS: MCP HTTP lifecycle, scopes/SQL/files, 520-message and dense pagination, images, OneBot fixtures, cancel/revoke, accounts, quotas and settings')

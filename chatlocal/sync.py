@@ -12,18 +12,32 @@ from .sync_state import now
 
 
 @contextmanager
-def _file_lock(name):
+def _file_lock(name, *, wait=0, cancel=None):
     path=ROOT/'.tmp'/name
     with path.open('a+b') as handle:
-        handle.seek(0);handle.write(b'0');handle.flush();handle.seek(0)
-        try:
-            if os.name == 'nt':
-                import msvcrt
-                msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(),fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:raise ValueError('正在读取或导入数据，请稍后重试。') from None
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b'0')
+            handle.flush()
+        deadline = time.monotonic() + wait
+        while True:
+            handle.seek(0)
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError('正在读取或导入数据，请稍后重试。') from None
+                interval = min(.05, remaining)
+                if cancel is None:
+                    time.sleep(interval)
+                elif cancel.wait(interval):
+                    raise ValueError('正在读取或导入数据，请稍后重试。') from None
         try:yield
         finally:
             if os.name == 'nt':
@@ -34,9 +48,9 @@ def _file_lock(name):
 
 
 @contextmanager
-def message_commit_lock():
+def message_commit_lock(*, wait=0, cancel=None):
     """Serialize media/archive mutation, message commits, and user deletion."""
-    with _file_lock('message-commit.lock'):yield
+    with _file_lock('message-commit.lock', wait=wait, cancel=cancel):yield
 
 
 @contextmanager
@@ -116,7 +130,7 @@ def sync_messages(store, platforms=None, *, load_stickers=False, progress=None, 
                         for attempt in range(3):
                             read_started=time.perf_counter()
                             result=runner(command,cwd=ROOT,env=dict(os.environ,PYTHONUTF8='1',CHATLOCAL_SYNC_METRICS=str(folder/'metrics.json')),capture_output=True,
-                                text=True,encoding='utf-8',errors='replace',timeout=600,creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                text=True,encoding='utf-8',errors='replace',timeout=600,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
                             timing['reader_seconds']=timing.get('reader_seconds',0)+time.perf_counter()-read_started
                             timing['attempts']=attempt+1
                             try:

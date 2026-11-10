@@ -48,6 +48,7 @@ def independent_import_scope(root):
             return dict(ok=True,payload=dict(messages=[]),checkpoint=dict(account='test',cursors={'tail':[10,20]}),
                         observed_at=time.time(),metrics={})
         with patch('chatlocal.live.wake_signature',return_value=('test',('unchanged',))), \
+             patch('scripts.incremental_common.bootstrap_time',return_value=int(time.time())-300), \
              patch('chatlocal.live.message_commit_lock',side_effect=nullcontext), \
              patch.object(manager,'client_running',return_value=True), \
              patch.object(manager,'worker',return_value=SimpleNamespace(read=read)),patch.object(manager,'log'):
@@ -145,6 +146,46 @@ def main():
         try:boundary(db,'native','local_id',['server_id','create_time'],after,allow_server_ack=True)
         except ValueError:pass
         else:raise AssertionError('Reused server identity accepted')
+        db.execute('UPDATE native SET server_id=20')
+        db.execute('INSERT INTO native VALUES(8,40,124)')
+        db.execute('DELETE FROM native WHERE local_id=7')
+        try:boundary(db,'native','local_id',['server_id','create_time'],after)
+        except ValueError:pass
+        else:raise AssertionError('Missing boundary silently advanced')
+        recovered=boundary(db,'native','local_id',['server_id','create_time'],after,replay_missing=True)
+        assert recovered.pop('replay_from')==0 and recovered['last']==8
+        db.execute('DELETE FROM native WHERE local_id=8')
+        try:boundary(db,'native','local_id',['server_id','create_time'],after,replay_missing=True)
+        except ValueError:pass
+        else:raise AssertionError('Sequence rewind silently accepted')
+        db.close()
+        # Unsupported native rows (e.g. calls) can change after they become
+        # the cursor. Replay that conversation so later messages are not lost.
+        from live_reader import wechat_boundary, error_code
+        assert error_code(ValueError('源消息游标失效：数据库可能被替换或清理。请补读历史后重建同步进度。'))=='sequence_reset'
+        assert error_code(ValueError('源消息序列倒退；请补读历史后重建同步进度。'))=='sequence_reset'
+        assert error_code(ValueError('private information'))=='reader_failed'
+        db=sqlite3.connect(':memory:')
+        db.execute('CREATE TABLE native(local_id INTEGER PRIMARY KEY,local_type INT,server_id INT,create_time INT)')
+        db.execute('INSERT INTO native VALUES(7,50,20,123)')
+        before=wechat_boundary(db,'native',None,lambda:False,lambda:False)
+        db.execute('UPDATE native SET server_id=30 WHERE local_id=7')
+        db.execute('INSERT INTO native VALUES(8,1,40,124)')
+        replay=wechat_boundary(db,'native',before,lambda:False,lambda:False)
+        assert replay.pop('replay_from')==0 and replay['last']==8
+        assert db.execute('SELECT local_id FROM native WHERE local_id>? AND local_id<=? ORDER BY local_id',(0,replay['last'])).fetchall()==[(7,),(8,)]
+        db.execute('UPDATE native SET local_type=1 WHERE local_id=7')
+        try:wechat_boundary(db,'native',before,lambda:False,lambda:False)
+        except ValueError:pass
+        else:raise AssertionError('Changed supported boundary accepted without verification')
+        db.execute('UPDATE native SET local_type=50 WHERE local_id=7')
+        try:wechat_boundary(db,'native',before,lambda:False,lambda:True)
+        except ValueError:pass
+        else:raise AssertionError('Imported boundary accepted without identity verification')
+        db.execute('DELETE FROM native WHERE local_id>=7')
+        try:wechat_boundary(db,'native',before,lambda:False,lambda:False)
+        except ValueError:pass
+        else:raise AssertionError('Unsupported boundary rewind accepted')
         db.close()
     print('PASS: import/live scope independence, legacy cursor migration, live-disable cancellation, atomic cursor rollback, hot/cold dedup, QQ/WeChat acknowledgements, native aliases, ID/content conflict rejection, deletion tombstones, settings persistence, WeChat identity. Synthetic only.')
 

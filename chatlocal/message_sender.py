@@ -1,4 +1,5 @@
 """Explicitly approved sends only. This module is never registered as an Agent tool."""
+from . import reply_timing as timing
 import os
 import time
 from typing import Protocol
@@ -58,23 +59,28 @@ class QQSender:
         allowed={'get_login_info','get_group_info','get_group_member_info','get_friend_list','get_group_msg_history','get_friend_msg_history','get_msg'}
         if action not in (allowed|({'send_group_msg','send_private_msg'} if sending else set())):raise SendError('接口不在发送适配器白名单中。')
         try:
-            with httpx.Client(timeout=httpx.Timeout(20,connect=4),trust_env=False,follow_redirects=False,transport=self.transport) as client:
-                token=self.config['REPLY_ONEBOT_TOKEN']
-                r=client.post(self.url+'/'+action,json=payload,headers={'Authorization':'Bearer '+token} if token else {})
-                r.raise_for_status()
-                if len(r.content)>2*1024*1024:raise ValueError('large')
-                value=r.json()
-                if not isinstance(value,dict):raise ValueError('format')
-                if value.get('status')!='ok' or value.get('retcode')!=0:
-                    # Async/queued responses can already have delivered; never retry.
-                    if sending:raise SendUncertain('发送接口未给出确定成功回执，请先到 QQ 核对；本条不会自动重发。')
-                    raise SendError('OneBot 未返回成功结果，请检查接口和登录状态。')
-                return value.get('data')
+            with timing.span('onebot.'+action):
+                with timing.span('onebot.client_create'):
+                    client=httpx.Client(timeout=httpx.Timeout(20,connect=4),trust_env=False,follow_redirects=False,transport=self.transport)
+                with client:
+                    token=self.config['REPLY_ONEBOT_TOKEN']
+                    with timing.span('onebot.http_roundtrip'):
+                        r=client.post(self.url+'/'+action,json=payload,headers={'Authorization':'Bearer '+token} if token else {})
+                    r.raise_for_status()
+                    if len(r.content)>2*1024*1024:raise ValueError('large')
+                    value=r.json()
+                    if not isinstance(value,dict):raise ValueError('format')
+                    if value.get('status')!='ok' or value.get('retcode')!=0:
+                        # Async/queued responses can already have delivered; never retry.
+                        if sending:raise SendUncertain('发送接口未给出确定成功回执，请先到 QQ 核对；本条不会自动重发。')
+                        raise SendError('OneBot 未返回成功结果，请检查接口和登录状态。')
+                    return value.get('data')
         except SendError:raise
         except (httpx.HTTPError,ValueError,TypeError):
             if sending:raise SendUncertain('发送结果未知（超时、连接中断或回执无效）。请到 QQ 核对，本条禁止再次发送以免重复。') from None
             raise SendError('无法核对本机 OneBot 接口，请检查地址、Token 和登录状态；未发送。') from None
 
+    @timing.stage('send.check_target')
     def check_target(self,target):
         account,kind,peer=qq_address(target)
         info=self.call('get_login_info',{})
@@ -158,7 +164,9 @@ class QQSender:
         info=self.call('get_msg',dict(message_id=int(mid)))
         sender=info.get('sender') if isinstance(info,dict) and isinstance(info.get('sender'),dict) else {}
         if (not isinstance(info,dict) or str(info.get('message_id'))!=mid
-                or info.get('message_type')!='group' or str(info.get('group_id'))!=address['peer']
+                or info.get('message_type')!=('group' if address['kind']=='group' else 'private')
+                or (str(info.get('group_id'))!=address['peer'] if address['kind']=='group' else
+                    (str(info.get('target_id'))!=address['peer'] if str(sender.get('user_id'))==address['account'] else str(info.get('user_id'))!=address['peer']))
                 or ('self_id' in info and str(info['self_id'])!=address['account'])
                 or str(sender.get('user_id'))!=response_target['sender_id']
                 or type(info.get('time')) is not int or info['time']!=response_target['timestamp']//1000
@@ -166,14 +174,15 @@ class QQSender:
             raise SendError('无法核对引用目标的账号、群、发送者和时间，或原消息已撤回；未发送。')
         return info
 
+    @timing.stage('send.check_reply_target')
     def chat_targets(self,address,response_target,quote,mentions):
         """Verify a cached live event against OneBot, never a local M/NT ID.
 
         The caller resolves the event in its own authorized session. OneBot
         lookups are repeated before dispatch to reject stale mappings/members.
         """
-        if address['kind']!='group':raise SendError('原生引用和 @ 仅用于当前持续群聊，未发送。')
-        if response_target and response_target.get('conversation_id')!=f'{address["account"]}:group:{address["peer"]}':
+        if address['kind']!='group' and mentions:raise SendError('私聊不能使用群成员 @，未发送。')
+        if response_target and response_target.get('conversation_id')!=f'{address["account"]}:{address["kind"]}:{address["peer"]}':
             raise SendError('回应目标不属于当前账号和群，未发送。')
         quote_id=None
         if quote:
@@ -186,11 +195,13 @@ class QQSender:
                 raise SendError('无法核对 @ 对象仍是当前群的指定成员，未发送。')
         return quote_id
 
+    @timing.stage('send.prepare')
     def prepare_chat(self,target,*,response_target=None,quote=False,mention_user_ids=()):
         address=self.check_target(target)
         return dict(address,chat_send=True,response_target=response_target,mention_user_ids=list(mention_user_ids),
                     quote_id=self.chat_targets(address,response_target,quote,mention_user_ids))
 
+    @timing.stage('send.adapter')
     def send(self,target,text,prepared,*,guard=None):
         address=self.check_target(target)
         if any(address[k]!=prepared[k] for k in ('account','kind','peer','name')):raise SendError('目标会话信息已变化，请重新确认，未发送。')

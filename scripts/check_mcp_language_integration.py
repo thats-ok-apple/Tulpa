@@ -11,6 +11,8 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).parent))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from check_mcp_reactions import ReactionBot, Events, eventually, ROOT
 from check_mcp_language_learning import expression_fixture,review_fixture
 from chatlocal.store import Store
@@ -46,7 +48,7 @@ def main():
         assert address[0] in ('127.0.0.1','localhost','::1') and address[1] in ports,address
         return connect(address,*args,**kw)
     try:
-        with tempfile.TemporaryDirectory(prefix='tulpa-language-wire-') as tmp,patch.dict('os.environ',{},clear=True),patch('socket.create_connection',restrict):
+        with tempfile.TemporaryDirectory(prefix='tulpa-language-wire-') as tmp,patch.dict('os.environ',isolated_env(),clear=True),patch('socket.create_connection',restrict):
             root=Path(tmp);store=Store(root/'chats.sqlite3')
             (root/'.env').write_text(f'REPLY_ONEBOT_URL=http://127.0.0.1:{server.server_port}\nREPLY_ONEBOT_WS_URL=ws://127.0.0.1:{events.port}\nREPLY_ONEBOT_WS_TOKEN=event-fixture\n','utf-8')
             with patch('chatlocal.onebot.ROOT',root),patch('chatlocal.message_sender.ROOT',root):
@@ -69,12 +71,25 @@ def main():
                         event=dict(post_type='message',message_type='group',self_id=111,group_id=222,message_id=mid,
                             user_id=uid,time=int(time.time()),sender={'user_id':uid},message=[dict(type='text',data={'text':text})])|extra
                         tools.chat.receive(event)
+                    def resume_wait():
+                        read=call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0)
+                        if read['messages']:
+                            decision=call('plan_chat_reply',session_id=sid,batch_id=read['input_batch']['id'],
+                                idempotency_key='language-silent-'+read['input_batch']['id'],
+                                action='silence',intent='合成学习验收，本轮不发言',expressions=[])
+                            assert decision['state']=='SILENT',decision
+                            args=dict(decision['next_call']['arguments'],timeout_seconds=1,quiet_seconds=0)
+                            read=call('wait_chat_messages',**args)
+                        return read
                     # Old history, SELF, synthetic and foreign-group are never evidence.
                     receive(-1,'SELF',111);receive(-2,'摘要',synthetic=True);receive(-3,'旧历史',time=int(time.time())-86400)
                     receive(-4,'别群机密',group_id=223);assert size()==0
                     with patch.object(store,'connect',side_effect=AssertionError('historical DB accessed')):
                         for i in range(10):receive(-100-i,f'云朵开机 合成实时内容{i}')
                         assert size()==10
+                        # Learning yields to unread chat; explicitly decide silence
+                        # and acknowledge the batch before testing stage priority.
+                        resume_wait()
                         timer[0]+=29;assert call('claim_chat_learning',session_id=sid,context_id='new-host-context')['state']=='no_task'
                         timer[0]+=1
                         # Current reply work has priority; abandoned plans
@@ -89,13 +104,8 @@ def main():
                         with access.connect() as db:db.execute("DELETE FROM chat_turn_plans WHERE id='priority'")
                         assert t['stage']=='extract' and len(t['material']['messages'])==10
                         def submit(task,result,inv):return call('submit_chat_learning',session_id=sid,job_id=task['job_id'],lease=task['lease'],invocation_id=inv,result=result)
-                        def resume_wait():
-                            read=call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0)
-                            if read['messages']:
-                                read=call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,acknowledge_through_id=read['read_through_id'])
-                            return read
                         ids=[m['source_id'] for m in t['material']['messages']]
-                        result=dict(expressions=[expression_fixture(t['material']['messages'][i],'情境'+str(i),'抽象方式'+str(i)) for i in range(3)],jargon=[dict(term='云朵开机',source_id=ids[0])])
+                        result=dict(expressions=[expression_fixture(t['material']['messages'][i],'情境'+str(i),'抽象方式'+str(i)) for i in range(3)])
                         bad=json.loads(json.dumps(result));bad['expressions'][1]['surface_form']='{全部内容}'
                         error=submit(t,bad,'failed-field-check')
                         assert error['field']=='expressions[1].surface_form' and error['error_code']=='invalid_expression_form'
@@ -103,15 +113,21 @@ def main():
                         assert submit(t,result,'actual-call-1')['state']=='stage_completed'
                         assert resume_wait()['event']=='learning_ready'
                         t=call('claim_chat_learning',session_id=sid,context_id='new-host-context')['task']
+                        assert t['stage']=='extract_jargon' and t['context_verification']['isolated'] is False
+                        from check_mcp_language_learning import jargon_fixture
+                        assert submit(t,jargon_fixture(t),'actual-jargon-call')['state']=='completed'
+                        assert resume_wait()['event']=='learning_ready'
+                        t=call('claim_chat_learning',session_id=sid,context_id='new-host-context')['task']
                         assert t['stage']=='review'
                         assert submit(t,review_fixture(t),'actual-call-2')['state']=='completed'
                         assert call('get_chat_learning',session_id=sid)['usable_expressions']==3
                     assert asyncio.run(wire(service,created['token'],sid))
-                    # Server-authoritative binding: knowing another SID or
-                    # choosing a new cid cannot inspect the old partition.
+                    # One connection can learn in two groups. Each session
+                    # still resolves its own library and evidence partition.
                     denied=call('start_chat_session',conversation_id='111:group:223',persona_preset='little_whale_v2',idempotency_key='fixture-other')
                     other_sid=denied['session']['id']
-                    assert call('get_chat_learning',session_id=other_sid)['error_code']=='new_host_context_required'
+                    other=call('get_chat_learning',session_id=other_sid)
+                    assert other['enabled'] and other['expression_count']==0 and other['library_key']=='qq:111:group:223'
                     call('stop_chat_session',session_id=other_sid)
                     bad=call('claim_chat_learning',session_id=sid,context_id='fresh-context',account_id='999')
                     assert bad['error_code']=='invalid_arguments'
@@ -131,8 +147,8 @@ def main():
                     call('stop_chat_session',session_id=sid)
                     assert call('get_chat_learning',session_id=sid).get('expression_count') is None
                     print(json.dumps(dict(status='passed',transport='MCP HTTP + loopback WS',observations=10,
-                        model_calls='2 simulated separate invocations',historical_db_reads=0,external_writes=0,
-                        checks=['scope and grant pin','API opt-in and CSRF','SELF/history/synthetic/foreign filter','extract-review-persist',
+                        model_calls='3 simulated separate invocations',historical_db_reads=0,external_writes=0,
+                        checks=['account/group libraries independent of grant','API opt-in and CSRF','SELF/history/synthetic/foreign filter','extract-review-persist',
                                 'default self-check usable with 10-expression threshold','tool discovery','disable record','disconnect/stop late result rejected']),ensure_ascii=False))
     finally:
         server.shutdown();events.close()

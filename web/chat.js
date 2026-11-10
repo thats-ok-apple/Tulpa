@@ -191,7 +191,7 @@ async function tickChatBrowser() {
   finally {chatPollBusy=false;scheduleChatPoll();}
 }
 function showImage(url){$('image-preview').src=url;if(!$('image-dialog').open)$('image-dialog').showModal();}
-$('browse-chats').onclick=()=>openChat();
+if($('browse-chats'))$('browse-chats').onclick=()=>openChat();
 let chatSearchTimer;
 function filterChatChoices(){++chatListRequest;chatListVersion=null;chatConversations=[];clearTimeout(chatSearchTimer);chatSearchTimer=setTimeout(()=>loadChatConversations(true),180);}
 $('chat-search').addEventListener('input',filterChatChoices);

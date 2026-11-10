@@ -1,9 +1,12 @@
 """Multi-account directory/API fixtures; no real client, key extraction or model calls."""
+import ast
 import json
+import ntpath
 from pathlib import Path
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -19,6 +22,44 @@ def fails(fn,contains=''):
         assert contains in str(exc),(contains,str(exc))
         return
     raise AssertionError('Expected rejection')
+
+
+def wechat_account_roots():
+    # Exercise the installed patch with Windows path semantics on any host.
+    # Load only directory helpers: no client, keys or database contents.
+    source=ROOT/'tools/wechat-reader/wechatauto/db.py'
+    tree=ast.parse(source.read_text('utf-8'))
+    names={'_locate_account_root','_find_account_dirs'}
+    functions=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
+    assert len(functions)==len(names)
+    namespace={}
+    code='from __future__ import annotations\n'+'\n'.join(ast.unparse(node) for node in functions)
+    exec(compile(code,str(source),'exec'),namespace)
+    for root in ('E:\\', 'E:/', 'E:\\Chat Data\\', '\\\\server\\share\\'):
+        base=ntpath.normpath(root)
+        for container in ('','xwechat_files','WeChat Files','xwechat_files_data'):
+            account_root=ntpath.join(base,container) if container else base
+            ids=['custom_fixture_b','wxid_fixture_a']
+            entries={base:[],account_root:ids+['all_users']}
+            if container:entries[base]=[container]
+            for account in ids:
+                entries[ntpath.join(account_root,account)]=['db_storage']
+                entries[ntpath.join(account_root,account,'db_storage')]=[]
+            entries[ntpath.join(account_root,'all_users')]=[]
+            def listdir(path):
+                key=ntpath.normpath(path)
+                if key not in entries:raise FileNotFoundError(path)
+                return entries[key]
+            # Drive-relative E: deliberately differs from absolute E:\\, as when
+            # Tulpa is launched from a subdirectory on the same drive.
+            namespace['os']=SimpleNamespace(
+                path=SimpleNamespace(join=ntpath.join,normpath=ntpath.normpath,
+                    isdir=lambda path:ntpath.normpath(path) in entries),listdir=listdir)
+            found=namespace['_locate_account_root'](root)
+            assert found==account_root,(root,container,found)
+            assert namespace['_find_account_dirs'](found)==[ntpath.join(account_root,account) for account in ids]
+            for account in ids:del entries[ntpath.join(account_root,account,'db_storage')]
+            assert namespace['_locate_account_root'](root) is None
 
 
 def directories(folder):
@@ -134,6 +175,7 @@ def api(folder):
 
 
 if __name__=='__main__':
+    wechat_account_roots()
     for bad in ('','../bad','a/b','a\\b','C:bad','a\n',{},'..'):
         fails(lambda:account_id(bad))
     assert choose_account('wechat',['custom_account'])=='custom_account'

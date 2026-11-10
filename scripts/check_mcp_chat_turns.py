@@ -19,6 +19,8 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).parent))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from check_fixture_support import isolated_env
 from check_mcp_reactions import ReactionBot, Events, eventually, ROOT
 from chatlocal.store import Store
 from chatlocal.mcp_routes import install_mcp_routes
@@ -53,6 +55,131 @@ async def wire(service,token,sid):
                 return dict(discovered=True,state=sent['state'],bubble_count=len(sent['bubbles']))
 
 
+async def wire_waiting(service,ui):
+    """Follow actual server call templates, including a stale client's ACK."""
+    access=service.access;chat=service.tools.chat
+    cfg=dict(name='deferred fixture',platforms=['qq'],conversations=[['qq','111:group:223']],send=True,chat=True)
+    g=access.create(cfg);serial=0
+    async with httpx.AsyncClient(headers={'Authorization':'Bearer '+g['token']},trust_env=False,timeout=20) as http:
+        async with streamable_http_client(service.status()['url'],http_client=http) as (r,w,_):
+            async with ClientSession(r,w) as client:
+                await client.initialize()
+                async def call(name,**args):
+                    result=await client.call_tool(name,args)
+                    assert not result.isError,result
+                    return result.structuredContent
+                async def follow(value,**extra):
+                    return await call(value['tool'],**dict(value['arguments'],**extra))
+                async def start():
+                    nonlocal serial
+                    serial+=1
+                    return (await call('start_chat_session',conversation_id='111:group:223',persona='fixture',idempotency_key=f'wait-start-{serial}'))['session']['id']
+                sid=await start()
+                def add():
+                    nonlocal serial
+                    serial+=1;mid=880000+serial
+                    chat.receive(dict(post_type='message',message_type='group',self_id=111,group_id=223,message_id=mid,
+                        user_id=444,time=time.time(),message=[dict(type='text',data=dict(text='deferred fixture'))]))
+                    with access.connect() as db:return db.execute('SELECT id FROM chat_inbox WHERE session_id=? AND message_id=?',(sid,str(mid))).fetchone()[0],mid
+                async def defer(seconds=20):
+                    packet=await call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0)
+                    assert packet['next_call']==packet['input_batch']['plan_call'] and 'action' in packet['next_call']['requires']
+                    assert 'acknowledge_through_id' not in packet['next_call']['arguments']
+                    p=await follow(packet['next_call'],action='wait',intent='暂缓决定',wait_seconds=seconds)
+                    assert p['state']=='WAITING' and not p['turn_complete']
+                    assert 'acknowledge_through_id' not in p['next_call']['arguments']
+                    return packet,p
+                def due(p,expire=False):
+                    with access.connect() as db:
+                        data=json.loads(db.execute('SELECT payload FROM chat_turn_plans WHERE id=?',(p['plan_id'],)).fetchone()[0])
+                        data['not_before']=time.time()-1
+                        db.execute('UPDATE chat_turn_plans SET payload=?,created=created-? WHERE id=?',(json.dumps(data),1000 if expire else 0,p['plan_id']))
+                        if expire:db.execute('UPDATE chat_input_batches SET created=created-1000 WHERE id=?',(p['decision']['batch_id'],))
+                eid,mid=add();packet,p=await defer();cursor=chat.row(sid)['cursor']
+                began=time.monotonic()
+                early=await follow(p['next_call'],timeout_seconds=1,acknowledge_through_id=packet['read_through_id'])
+                assert time.monotonic()-began>=.9 and early['event']=='idle' and not early['decision_required'] and not early['messages'],early
+                assert chat.row(sid)['cursor']==cursor and early['deferred_until']>time.time()
+                due(p,expire=True)
+                resumed=await follow(early['next_call'],timeout_seconds=1)
+                assert resumed['decision_required'] and [m['id'] for m in resumed['messages']]==[eid]
+                assert resumed['input_batch']['id']!=packet['input_batch']['id']
+                assert resumed['next_call']==resumed['input_batch']['plan_call']
+                ready=await follow(resumed['next_call'],action='reply',intent='到期回复',target_event_id=eid,expressions=['text'])
+                assert ready['state']=='READY',ready
+                sent=await follow(ready['next_call'],expression_ids=[],bubbles=[dict(kind='text',text='deferred fixture reply')])
+                assert sent['state']=='SUCCEEDED',sent
+                idle=await follow(sent['next_call'],timeout_seconds=1)
+                assert not idle['decision_required'] and chat.row(sid)['cursor']>=eid
+                eid,_=add();_,p=await defer(seconds=1)
+                until=chat.turns.waiting(sid)['not_before']
+                resumed=await follow(p['next_call'],timeout_seconds=2)
+                assert time.time()>=until and resumed['decision_required'] and resumed['messages'][0]['id']==eid
+                silent=await follow(resumed['input_batch']['plan_call'],action='silence',intent='到期后不参与')
+                assert (await follow(silent['next_call'],timeout_seconds=1))['event']=='idle'
+                # A fresh input can interrupt the deliberate wait without
+                # losing the original input; silence then ACK finishes both.
+                old,_=add();packet,p=await defer();new,_=add()
+                resumed=await follow(p['next_call'],timeout_seconds=1)
+                assert {old,new}<={m['id'] for m in resumed['messages']} and resumed['decision_required']
+                silent=await follow(resumed['input_batch']['plan_call'],action='silence',intent='本轮不参与')
+                idle=await follow(silent['next_call'],timeout_seconds=1)
+                assert idle['event']=='idle' and not chat.turns.waiting(sid)
+                # A new-input page supersedes the timer; its continuation must
+                # not remain stuck behind the original deferred ACK guard.
+                old,_=add();_,p=await defer();new=[add()[0] for _ in range(33)]
+                resumed=await follow(p['next_call'],timeout_seconds=1)
+                assert resumed['has_more'] and not chat.turns.waiting(sid)
+                tail=await follow(resumed['next_call'],timeout_seconds=1)
+                assert set([old]+new)<={m['id'] for m in resumed['messages']+tail['messages']} and not tail['has_more']
+                silent=await follow(tail['input_batch']['plan_call'],action='silence',intent='分页处理完毕')
+                assert (await follow(silent['next_call'],timeout_seconds=1))['event']=='idle'
+                # Without new input, expiry must also release the page ACK:
+                # the original batch can be larger than the next wait's page.
+                original=[add()[0] for _ in range(35)]
+                packet=await call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,limit=50)
+                assert [m['id'] for m in packet['messages']]==original and not packet['has_more']
+                p=await follow(packet['input_batch']['plan_call'],action='wait',intent='分页前暂缓',wait_seconds=1)
+                cursor=chat.row(sid)['cursor'];until=chat.turns.waiting(sid)['not_before']
+                resumed=await follow(p['next_call'],timeout_seconds=2,quiet_seconds=0)
+                assert time.time()>=until and [m['id'] for m in resumed['messages']]==original[:30]
+                assert resumed['has_more'] and not chat.turns.waiting(sid)
+                assert chat.row(sid)['cursor']==cursor,'expiry acknowledged input before page delivery'
+                assert resumed['next_call']['arguments']['acknowledge_through_id']==original[29]
+                tail=await follow(resumed['next_call'],timeout_seconds=1,quiet_seconds=0)
+                assert [m['id'] for m in tail['messages']]==original[30:] and not tail['has_more']
+                assert chat.row(sid)['cursor']==original[29]
+                ready=await follow(tail['input_batch']['plan_call'],action='reply',intent='分页后回复',
+                    target_event_id=original[-1],expressions=['text'])
+                assert ready['state']=='READY',ready
+                sent=await follow(ready['next_call'],expression_ids=[],bubbles=[dict(kind='text',text='paged deferred reply')])
+                assert sent['state']=='SUCCEEDED',sent
+                idle=await follow(sent['next_call'],timeout_seconds=1)
+                assert not idle['decision_required'] and not idle['messages'] and chat.row(sid)['cursor']>=original[-1],idle
+                # Recall removes the deferred decision, not a new live event.
+                eid,mid=add();_,p=await defer()
+                chat.recall(dict(self_id=111,group_id=223,message_id=mid));due(p)
+                recalled=await follow(p['next_call'],timeout_seconds=1)
+                assert not recalled['decision_required'] and not chat.turns.waiting(sid)
+                assert (await follow(recalled['next_call'],timeout_seconds=1))['event']=='idle'
+                # Cancellation cannot return a late decision or dispatch; a
+                # later explicit read may still recover unprocessed input.
+                add();_,p=await defer();cancel=threading.Event()
+                task=asyncio.create_task(asyncio.to_thread(service.tools.call,g['token'],'wait_chat_messages',dict(p['next_call']['arguments'],timeout_seconds=10),cancel))
+                while sid not in chat.waiters:await asyncio.sleep(.01)
+                before=len(ReactionBot.sent);cancel.set()
+                assert (await task).structuredContent['event']=='cancelled' and len(ReactionBot.sent)==before
+                await call('stop_chat_session',session_id=sid)
+                assert (await follow(p['next_call'],timeout_seconds=1))['event']=='stopped'
+                assert not chat.turns.waiting(sid)
+                sid=await start();add();_,p=await defer()
+                assert ui.post('/api/mcp/connections/'+g['id']+'/revoke',json={},headers={'Origin':'http://testserver','X-ChatWeave-UI':'1'}).status_code==200
+                denied=await http.post(service.status()['url'],json=dict(jsonrpc='2.0',id=999,method='tools/call',
+                    params=dict(name='wait_chat_messages',arguments=dict(p['next_call']['arguments'],timeout_seconds=1))))
+                assert denied.status_code==401 and not chat.row(sid)['active'] and not chat.turns.waiting(sid)
+    return 'real MCP deferred ACK, deadline, expired batch/plan, new input, silence/success, recall/cancel/stop/revoke'
+
+
 def main():
     assert Path(__import__('chatlocal.mcp_chat_turns',fromlist=['ChatTurns']).__file__).resolve()==ROOT/'chatlocal/mcp_chat_turns.py'
     whale=ROOT/'chatlocal/prompts/mcp_chat/little_whale.md';before=hashlib.sha256(whale.read_bytes()).hexdigest()
@@ -65,7 +192,7 @@ def main():
         network.append(address);return connect(address,*args,**kwargs)
     results=[];counter=0
     try:
-        with tempfile.TemporaryDirectory(prefix='tulpa-turns-') as tmp,patch.dict('os.environ',{},clear=True),patch('socket.create_connection',restrict):
+        with tempfile.TemporaryDirectory(prefix='tulpa-turns-') as tmp,patch.dict('os.environ',isolated_env(),clear=True),patch('socket.create_connection',restrict):
             root=Path(tmp);store=Store(root/'chats.sqlite3')
             (root/'.env').write_text(f'REPLY_ONEBOT_URL=http://127.0.0.1:{upstream.server_port}\nREPLY_ONEBOT_WS_URL=ws://127.0.0.1:{events.port}\nREPLY_ONEBOT_WS_TOKEN=event-fixture\n','utf-8')
             with patch('chatlocal.onebot.ROOT',root),patch('chatlocal.message_sender.ROOT',root):
@@ -84,6 +211,9 @@ def main():
                         nonlocal counter
                         counter+=1;return f'fixture-key-{counter:04}'
                     sid=call('start_chat_session',conversation_id='111:group:222',persona_preset='little_whale_v2',idempotency_key=key())['session']['id']
+                    assert next(s for s in call('list_chat_sessions')['sessions'] if s['id']==sid)['persona_preset']=='little_whale_v2'
+                    assert call('start_chat_session',conversation_id='111:group:222',persona_preset='little_whale_v2',idempotency_key=key())['session']['id']==sid
+                    assert call('start_chat_session',conversation_id='111:group:222',persona_preset='little_whale',idempotency_key=key())['error_code']=='chat_rejected'
                     # This suite checks the supported paused-learning chat mode.
                     # Automatic learning/idle wakes have a dedicated wire suite.
                     paused=ui.put(f'/api/mcp/chats/{sid}/learning',json=dict(enabled=False),headers={'X-ChatWeave-UI':'1'})
@@ -118,6 +248,8 @@ def main():
                     from chatlocal.mcp_tools import argument_problems,argument_validator
                     import jsonschema
                     schema=next(s['parameters'] for s in tools.schemas(grant) if s['name']=='wait_chat_messages')
+                    assert schema['properties']['timeout_seconds']['default']==150
+                    assert tools.chat.continuation(sid)['arguments']['timeout_seconds']==150
                     params=dict(session_id=sid,timeout_seconds=1)
                     argument_problems(params,schema);cache_before=argument_validator.cache_info()
                     began=time.perf_counter()
@@ -129,6 +261,28 @@ def main():
                     uncached_ms=(time.perf_counter()-began)*1000
                     validation_cost=dict(sample_calls=100,cached_ms=round(cached_ms,2),previous_ms=round(uncached_ms,2))
                     results.append('field-specific argument errors, no private value echo, schema cache retains validation')
+
+                    # Correct ordinary Planner arguments within the delivered
+                    # batch, without a forced context/material re-read.
+                    eid=add('契约测试');time.sleep(.18)
+                    known=read();bid=known['input_batch']['id']
+                    with patch.object(tools.chat,'read_context',side_effect=AssertionError('argument correction reread context')):
+                        wrong=call('plan_chat_reply',session_id=sid,batch_id=bid,action='reply',expressions=['text'],
+                            topic_event_ids=[999999],intent='synthetic correction')
+                        assert wrong['error_code']=='target_not_in_batch' and wrong['recovery']['action']=='correct_request'
+                        assert eid in wrong['valid_event_ids'] and wrong['recovery']['next_call']['arguments']['batch_id']==bid
+                        for action in ('wait','silence','reply'):
+                            bad=call('plan_chat_reply',session_id=sid,batch_id=bid,action=action,intent='synthetic',
+                                expressions=[] if action=='reply' else ['text'])
+                            assert bad['error_code']=='expression_mismatch' and bad['recovery']['action']=='correct_request'
+                    latest=add('纠错期间新补充');time.sleep(.18)
+                    correction=wrong['recovery']['next_call']
+                    blocked=call(correction['tool'],**correction['arguments'],action='reply',intent='corrected',expressions=['text'],target_event_id=eid)
+                    assert blocked['error_code']=='stale' and any(m['id']==latest for m in blocked['updated_chat']['context']['messages'])
+                    fix=blocked['recovery']['next_call']
+                    resolved=call(fix['tool'],**fix['arguments'],action='silence',intent='本批已判断')
+                    assert resolved['state']=='SILENT'
+                    with access.connect() as db:db.execute('DELETE FROM calls')
 
                     # MCP ordinary get/legacy sends are not a quiet-window bypass.
                     fast_policy=policy.read_text('utf-8');policy.write_text('{"quiet_seconds":2,"reply_cooldown_seconds":0}','utf-8')
@@ -151,11 +305,25 @@ def main():
                     assert len(batch['input_batch']['bursts'][0]['event_ids'])==3
                     p=plan(last,batch=batch);assert p['state']=='READY',p
                     # New same-speaker correction while model was composing.
-                    add('更正，改成明天');out=send(p)
+                    correction=add('更正，改成明天')
+                    original_context=tools.chat.context
+                    def unlocked_context(*args,**kwargs):
+                        assert not tools.chat.turns.lock(sid).locked() and not tools.chat.lock._is_owned()
+                        return original_context(*args,**kwargs)
+                    with patch.object(tools.chat,'context',side_effect=unlocked_context),patch.object(tools.chat,'get',side_effect=AssertionError('recursive recovery get')):out=send(p)
                     assert out['error_code']=='stale' and not ReactionBot.sent,out
-                    assert out['recovery']['next_call']==dict(tool='get_chat_session',arguments=dict(session_id=sid))
+                    recovery=out['recovery']['next_call']
+                    updated=out['updated_chat'];assert any(m['id']==correction for m in updated['context']['messages'])
+                    assert recovery==updated['input_batch']['plan_call'] and recovery['arguments']['session_id']==sid
+                    assert out['recovery']['automatic_write_retry'] is False
+                    # Another correction still rejects the newly delivered batch, without another explicit get.
+                    latest=add('再补充，明天下午')
+                    again=plan(correction,batch=updated)
+                    assert again['error_code']=='stale' and any(m['id']==latest for m in again['updated_chat']['context']['messages']) and not ReactionBot.sent,again
+                    time.sleep(.18)
+                    assert plan(latest,batch=again['updated_chat'])['state']=='READY'
                     assert send(p)['error_code']=='plan_not_ready'
-                    results.append('three-part collection, ordinary read cannot bypass, stale old answer blocked')
+                    results.append('three-part collection; unlocked stale result delivers fresh usable batch; another correction still blocks old answer')
 
                     # Unrelated busy traffic does not reset selected topic.
                     time.sleep(.18);p=plan(last);assert p['state']=='READY',p
@@ -169,6 +337,94 @@ def main():
                     finally:halt.set();worker.join()
                     results.append('unrelated traffic does not starve a selected response')
 
+                    # A selected speaker can move to another conversation while
+                    # the Agent composes. Native addressing, not speaker identity,
+                    # distinguishes that conversation and its unmarked followups.
+                    clear_budget()
+                    other=add('另一段对话',uid=444)
+                    with access.connect() as db:
+                        other_mid=db.execute('SELECT message_id FROM chat_inbox WHERE id=?',(other,)).fetchone()[0]
+                    last=add('请回答这条问题');time.sleep(.18);batch=read()
+                    add(uid=333,segments=[dict(type='at',data={'qq':'444'}),dict(type='text',data={'text':'先聊你那件事'})])
+                    add('接着补充旁边的话题')
+                    p=plan(last,batch=batch);assert p.get('state')=='READY',p
+                    add(uid=333,segments=[dict(type='reply',data={'id':other_mid}),dict(type='text',data={'text':'这条也在说另一件事'})])
+                    add('还是刚才那件旁边的事')
+                    before_send=len(ReactionBot.sent);out=send(p)
+                    assert out['state']=='SUCCEEDED' and len(ReactionBot.sent)==before_send+1,out
+                    results.append('same-speaker side conversations and their followups do not invalidate plan or send')
+
+                    # The collection gate must use the same routing as dispatch.
+                    # Copy only fixture times: an old question is quiet while a
+                    # side conversation is arbitrarily recent, without a race.
+                    with access.connect() as db:
+                        pending=[dict(r) for r in db.execute('SELECT * FROM chat_inbox WHERE session_id=? AND id>=? ORDER BY id',(sid,last))]
+                    for item in pending:
+                        payload=json.loads(item['payload'])
+                        payload['received_at']=0 if item['id']==last else time.time()+60
+                        item['payload']=json.dumps(payload)
+                    collected=tools.chat.turns.collection(tools.chat.row(sid),pending,2,time.monotonic())
+                    assert collected['reason']=='quiet' and collected['ready_to_send'],collected
+
+                    # Returning to the selected topic still invalidates the
+                    # answer, including native mixed addressing and late replies.
+                    for mode in ('quote','mention','term','reply_chain','continuation'):
+                        last=add('请回答原问题');time.sleep(.18)
+                        read()
+                        target_mid=tools.chat.response_target(tools.chat.row(sid),last)['onebot_message_id']
+                        if mode in ('reply_chain','continuation'):
+                            supplement=add(uid=555,segments=[dict(type='reply',data={'id':target_mid}),dict(type='text',data={'text':'补充条件'})])
+                            read()
+                            supplement_mid=tools.chat.response_target(tools.chat.row(sid),supplement)['onebot_message_id']
+                        else:
+                            add(uid=333,segments=[dict(type='at',data={'qq':'444'}),dict(type='text',data={'text':'旁边的话题'})])
+                        time.sleep(.18)
+                        p=plan(last,**({'topic_terms':['原题条件']} if mode=='term' else {}));assert p.get('state')=='READY',p
+                        if mode=='quote':
+                            segments=[dict(type='reply',data={'id':target_mid}),dict(type='at',data={'qq':'444'}),dict(type='text',data={'text':'原题更正'})]
+                        elif mode=='mention':
+                            segments=[dict(type='at',data={'qq':'444'}),dict(type='at',data={'qq':'111'}),dict(type='text',data={'text':'更正一下'})]
+                        elif mode=='term':
+                            segments=[dict(type='at',data={'qq':'444'}),dict(type='text',data={'text':'原题条件有变化'})]
+                        elif mode=='reply_chain':
+                            segments=[dict(type='reply',data={'id':supplement_mid}),dict(type='text',data={'text':'再改一个条件'})]
+                        else:segments=[dict(type='text',data={'text':'还要补充一个条件'})]
+                        correction=add(uid=555 if mode=='continuation' else 666 if mode=='reply_chain' else 333,segments=segments)
+                        prior=len(ReactionBot.sent);out=send(p)
+                        assert out.get('error_code')=='stale' and correction in out['refresh_event_ids'] and len(ReactionBot.sent)==prior,(mode,out)
+                    results.append('quiet collection ignores side traffic; quotes, mentions, topic terms, reply chains and corrections still block stale sends')
+
+                    # Refresh delivery can be acknowledged without fetching it
+                    # again, and recovery must start at the oldest unread input.
+                    clear_budget()
+                    page=call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,limit=50)
+                    while page['has_more']:
+                        page=call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,limit=50,
+                                  acknowledge_through_id=page['read_through_id'])
+                    call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,acknowledge_through_id=page['read_through_id'])
+                    cursor=tools.chat.row(sid)['cursor'];fresh=add('补读后不应再次交付')
+                    refreshed=read()
+                    assert refreshed['session']['cursor']==cursor and refreshed['session']['offered']==fresh
+                    next_call=refreshed['chat_prompt']['continue_with']
+                    assert next_call['arguments']['acknowledge_through_id']==fresh
+                    idle=call(next_call['tool'],**dict(next_call['arguments'],timeout_seconds=1,quiet_seconds=0))
+                    assert idle['event']=='idle' and not idle['messages'],idle
+                    unread=[add('未读分页 '+str(i),uid=444) for i in range(55)]
+                    refreshed=read()
+                    assert [m['id'] for m in refreshed['context']['messages'] if m['id']>fresh]==unread[:50]
+                    assert refreshed['context']['has_more'] and refreshed['session']['cursor']==fresh
+                    assert refreshed['session']['offered']==unread[49]
+                    rejected=call('wait_chat_messages',session_id=sid,timeout_seconds=1,acknowledge_through_id=unread[-1])
+                    assert rejected.get('error_code') and tools.chat.row(sid)['cursor']==fresh
+                    page=call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,limit=3)
+                    assert [m['id'] for m in page['messages']]==unread[:3] and page['has_more']
+                    refreshed=read();next_call=refreshed['chat_prompt']['continue_with']
+                    assert refreshed['session']['cursor']==fresh and next_call['arguments']['acknowledge_through_id']==unread[49]
+                    remaining=call(next_call['tool'],**dict(next_call['arguments'],timeout_seconds=1,quiet_seconds=0,limit=50))
+                    assert [m['id'] for m in remaining['messages']]==unread[50:]
+                    call('wait_chat_messages',session_id=sid,timeout_seconds=1,quiet_seconds=0,acknowledge_through_id=remaining['read_through_id'])
+                    results.append('refresh pages oldest unread input; explicit ACK cannot skip undelivered messages')
+
                     # Real spacing, one immutable queue and no duplicate dispatch.
                     clear_budget();last=add('引用和点名的目标');time.sleep(.18);p=plan(last)
                     assert p.get('state')=='READY',p
@@ -176,7 +432,9 @@ def main():
                     stamps=[];ReactionBot.intercept=lambda action,body:stamps.append(time.monotonic()) if action=='send_group_msg' else None
                     prior=len(ReactionBot.sent)
                     with ThreadPoolExecutor() as pool:
-                        first=pool.submit(send,p,bubbles);time.sleep(.03);duplicate=send(p,bubbles);out=first.result(15)
+                        first=pool.submit(send,p,bubbles)
+                        eventually(lambda:len(ReactionBot.sent)==prior+1)
+                        duplicate=send(p,bubbles);out=first.result(15)
                     assert out['state']=='SUCCEEDED',out
                     assert len(ReactionBot.sent)==prior+2 and stamps[-1]-stamps[-2]>=.25
                     assert send(p,bubbles)['state']=='SUCCEEDED' and len(ReactionBot.sent)==prior+2
@@ -200,6 +458,7 @@ def main():
                     out=send(p,[dict(kind='text',text='先说一点'),dict(kind='text',text='旧尾部不应该发')])
                     ReactionBot.intercept=None
                     assert out['state']=='INTERRUPTED' and out['reason']=='stale',out
+                    assert 'updated_chat' not in out and out['recovery']['automatic_write_retry'] is False
                     assert [b['state'] for b in out['bubbles']]==['SUCCEEDED','CANCELLED'] and len(ReactionBot.sent)==prior+1
                     assert send(p,[dict(kind='text',text='先说一点'),dict(kind='text',text='旧尾部不应该发')])['state']=='INTERRUPTED'
                     results.append('related reply to first bubble cancels tail; old queue cannot resume')
@@ -238,14 +497,18 @@ def main():
                     p=plan(last,expression=['reaction']);ReactionBot.mode='503';prior=len(ReactionBot.writes)
                     b=[dict(kind='reaction',event_id=last,reaction_id='unicode_fist',operation='add')]
                     out=send(p,b);ReactionBot.mode='ok';assert out['state']=='UNKNOWN',out
+                    assert 'updated_chat' not in out
+                    unknown_plan=p['plan_id']
                     assert send(p,b)['state']=='UNKNOWN' and len(ReactionBot.writes)==prior+1
                     old=tools.chat.turns;tools.chat.turns=ChatTurns(tools.chat)
                     assert send(p,b)['state']=='UNKNOWN' and len(ReactionBot.writes)==prior+1
-                    assert plan(last,batch=batch)['error_code']=='batch_expired'
+                    expired=plan(last,batch=batch)
+                    assert expired['error_code']=='batch_expired' and expired['updated_chat']['input_batch']
                     results.append('unknown no automatic retry, process epoch invalidates old input')
 
                     clear_budget();time.sleep(.18)
                     report=asyncio.run(wire(service,g['token'],sid));results.append('public MCP discovery -> plan -> queue -> OneBot fixture passed')
+                    results.append(asyncio.run(wire_waiting(service,ui)))
                     # Bounded collection forces reassessment, never permission to
                     # answer a still-active speaker. Ordinary get is still gated.
                     policy.write_text('{"quiet_seconds":2,"reply_cooldown_seconds":0}','utf-8')
@@ -253,7 +516,14 @@ def main():
                     with access.connect() as db:pending=db.execute('SELECT * FROM chat_inbox WHERE session_id=? AND id=?',(sid,current)).fetchall()
                     capped=tools.chat.turns.collection(tools.chat.row(sid),pending,2,time.monotonic()-9)
                     assert capped['reason']=='collection_limit' and not capped['ready_to_send']
-                    assert plan(current).get('error_code')=='needs_wait'
+                    # Start the quiet-window fixture after potentially expensive
+                    # context assembly; this checks the gate, not machine speed.
+                    fresh_batch=read()
+                    with access.connect() as db:
+                        fresh=json.loads(db.execute('SELECT payload FROM chat_inbox WHERE id=?',(current,)).fetchone()[0])
+                        fresh['received_at']=time.time()
+                        db.execute('UPDATE chat_inbox SET payload=? WHERE id=?',(json.dumps(fresh),current))
+                    assert plan(current,batch=fresh_batch).get('error_code')=='needs_wait'
                     policy.write_text(fast_policy,'utf-8');time.sleep(.18)
                     p=plan(current)
                     sid2=call('start_chat_session',conversation_id='111:group:223',persona_preset='little_whale',idempotency_key=key())['session']['id']
@@ -266,7 +536,8 @@ def main():
                         assert send(p)['error_code']=='source_unavailable'
                     assert len(ReactionBot.sent)==prior
                     with access.connect() as db:db.execute('UPDATE chat_turn_plans SET created=created-100 WHERE id=?',(p['plan_id'],))
-                    assert send(p)['error_code']=='plan_expired'
+                    expired=send(p)
+                    assert expired['error_code']=='plan_expired' and expired['updated_chat']['input_batch']
                     synthetic=add('not real',synthetic=True);time.sleep(.18)
                     assert plan(synthetic)['error_code']=='target_expired'
                     call('stop_chat_session',session_id=sid2)
@@ -304,13 +575,36 @@ def main():
                     assert repeated['event']=='idle' and tools.chat.row(sid)['note']=='new note'
                     assert tools.chat.row(sid)['cursor']>=human['read_through_id']
                     recent=read()['recent_turns'];assert recent[0]['plan_id']==p['plan_id'] and recent[0]['state']=='SUCCEEDED'
+                    assert next(t for t in recent if t['plan_id']==unknown_plan)['state']=='UNKNOWN'
+                    full=read();compact=call('get_chat_session',session_id=sid,response_format='compact',known_prompt_version=full['session']['prompt_version'])
+                    complete=next(t for t in compact['recent_turns'] if t['plan_id']==p['plan_id'])
+                    assert 'expression_selection' not in complete and all('receipt' not in b for b in complete['bubble_states'])
+                    assert full['recent_turns'][0]['bubbles'][0]['receipt']['state']=='SUCCEEDED'
+                    assert next(t for t in compact['recent_turns'] if t['plan_id']==unknown_plan)['bubble_states'][0]['receipt']['state']=='UNKNOWN'
                     results.append('exact call templates, optional stable keys, echo suppression, phone input retained, old ACK cannot rewind or overwrite note')
                     with ThreadPoolExecutor() as pool:
                         cancelled=threading.Event()
                         future=pool.submit(tools.call,g['token'],'wait_chat_messages',dict(session_id=sid,timeout_seconds=10,minimum_wait_seconds=5),cancelled)
-                        time.sleep(.1);cancelled.set()
-                        assert future.result(2).structuredContent['event']=='cancelled'
+                        eventually(lambda:sid in tools.chat.waiters)
+                        cancelled.set()
+                        assert future.result(3).structuredContent['event']=='cancelled'
                     results.append('retry backoff happens in wait tool, cancellation interrupts it')
+                    clear_budget();current=add('分页恢复目标');time.sleep(.18);paged_plan=plan(current)
+                    appended=[add('分页补充 '+str(i)) for i in range(52)]
+                    paged=send(paged_plan)
+                    assert paged['error_code']=='stale' and paged['updated_chat']['context']['has_more'],paged
+                    continuation=paged['recovery']['next_call']
+                    assert continuation['tool']=='wait_chat_messages' and continuation['arguments']['timeout_seconds']==150
+                    more=call(continuation['tool'],**dict(continuation['arguments'],timeout_seconds=1))
+                    delivered={m['id'] for m in paged['updated_chat']['context']['messages']+more['messages']}
+                    assert set(appended)<=delivered and not more['has_more']
+                    # Revoked/withdrawn targets remain refusals, not automatic resend material.
+                    time.sleep(.18);withdrawn=plan(appended[-1])
+                    with access.connect() as db:
+                        message_id=db.execute('SELECT message_id FROM chat_inbox WHERE id=?',(appended[-1],)).fetchone()[0]
+                    tools.chat.recall(dict(self_id=111,group_id=222,message_id=message_id))
+                    refused=send(withdrawn)
+                    assert refused['error_code']=='target_expired' and 'updated_chat' not in refused,refused
                     # Stop/revoke can run while queue sleeps; they cancel remaining work.
                     for mode in ('stop','revoke'):
                         if mode=='revoke':

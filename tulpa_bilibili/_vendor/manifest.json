@@ -1,0 +1,98 @@
+{
+  "project": "polylens-bilibili-mcp",
+  "version": "0.13.0",
+  "commit": "35b9c852342a9e8b8d09db78548d42d62b6f9d2a",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": "__init__.py",
+      "source": "src/polylens_bilibili/__init__.py",
+      "modified": true,
+      "sha256": "c40bb54593bacfc661741427d39703cf346e3c5039ec711eaa83b283734f984f"
+    },
+    {
+      "path": "api/__init__.py",
+      "source": "src/polylens_bilibili/api/__init__.py",
+      "modified": true,
+      "sha256": "341cbdaa1c134407fc66b5f0845bde05acf75d572ba9ff0cb5ead8747c70f8c1"
+    },
+    {
+      "path": "api/_comments.py",
+      "source": "src/polylens_bilibili/api/_comments.py",
+      "modified": false,
+      "sha256": "26a7ad34872084162d42b2bfc52a90f119e2235dfdccaaaa75408d8898c2bb6d"
+    },
+    {
+      "path": "api/_constants.py",
+      "source": "src/polylens_bilibili/api/_constants.py",
+      "modified": false,
+      "sha256": "4a05bf379a7850034fdced0bc576e6bebcf4bed76cfc38fa714917c47cb24466"
+    },
+    {
+      "path": "api/_feed.py",
+      "source": "src/polylens_bilibili/api/_feed.py",
+      "modified": false,
+      "sha256": "9cbf8b2c1f11817334ed5caef9639394ff510a1c352ac215436253f4ca8cb19d"
+    },
+    {
+      "path": "api/_http.py",
+      "source": "src/polylens_bilibili/api/_http.py",
+      "modified": false,
+      "sha256": "223b9b20599b3c2579878dd22612d7f8ad7867ff04e5d1ab91ce4a0113553649"
+    },
+    {
+      "path": "api/_login.py",
+      "source": "src/polylens_bilibili/api/_login.py",
+      "modified": false,
+      "sha256": "d5d1c44a31e48c25c1ef880fc4f0025db9ec9fb22d34b8e9093011bf4c4385fc"
+    },
+    {
+      "path": "api/_result_cache.py",
+      "source": "src/polylens_bilibili/api/_result_cache.py",
+      "modified": false,
+      "sha256": "4e8c463b8fad5ed5b0efd0ffbc46eeb250e27907e8c41108e4036c1f0f6a847f"
+    },
+    {
+      "path": "api/_search.py",
+      "source": "src/polylens_bilibili/api/_search.py",
+      "modified": false,
+      "sha256": "e482ef453fdfbc156e9f6c70d89e231077b2d24220e44b37d1e1d89788692444"
+    },
+    {
+      "path": "api/_signing.py",
+      "source": "src/polylens_bilibili/api/_signing.py",
+      "modified": false,
+      "sha256": "ddc9cd5d7a584167fb0c49c612f488f5e13c19742ed001b17f034e1997c6c591"
+    },
+    {
+      "path": "api/_subtitles.py",
+      "source": "src/polylens_bilibili/api/_subtitles.py",
+      "modified": false,
+      "sha256": "0b10ed8eb5315386aafb60e943d93d058d17d8b66b21cb7fe37e6c7b1f3f87fe"
+    },
+    {
+      "path": "api/_video.py",
+      "source": "src/polylens_bilibili/api/_video.py",
+      "modified": false,
+      "sha256": "1bbac8104665975bb93dc4d996d3ece34418b007f3acd094673cd4d8fbffdc28"
+    },
+    {
+      "path": "errors.py",
+      "source": "src/polylens_bilibili/errors.py",
+      "modified": false,
+      "sha256": "8f7cccb4732702462d1be74b0f1ed2a2b5d0acdc42940508740df435c189ff32"
+    },
+    {
+      "path": "LICENSE",
+      "source": "LICENSE",
+      "modified": false,
+      "sha256": "4a5505738183d65682c285bfa1adb355c3f4a5f16e51e436ad8a57f2b85dd9d9"
+    },
+    {
+      "path": "models.py",
+      "source": "src/polylens_bilibili/models.py",
+      "modified": false,
+      "sha256": "53718fc08b07da247ce68f3200178d0656100d4a5811180b887e098d8bd1b478"
+    }
+  ]
+}

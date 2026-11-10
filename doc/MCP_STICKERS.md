@@ -6,6 +6,7 @@
 
 | 动作 | 接口和行为 |
 | --- | --- |
+| 导入新图片 | `import_chat_image(session_id,data_base64)` 接收外部生成或用户提供的原图（纯 Base64，最多 6 MiB），返回预览、哈希和本会话的 `sticker_id`；需要看图和发送表情权限，仅导入、不发送。之后走同样的发送计划。文件上传脚本见 [接入说明](AGENT_SETUP.md#发送生成的图片)。 |
 | 看当前群图 | `read_chat_image(session_id,event_id,index)` 返回像素、动图最多三帧以及 `sticker_id`。该图可以直接发送，无需收藏。 |
 | 查找 | `list_chat_stickers(source="library",query="开心")` 查本授权笔记；默认 `source="qq"` 查 QQ 收藏。前者不访问 QQ，后者每次核对账号，但目录缓存一分钟，主动刷新至少间隔十秒，可跨 session 复用。目录最多 500 张，不自动批量下载或理解。 |
 | 看陌生收藏 | `read_chat_sticker(session_id,sticker_id)` 返回实际像素。QQ 收藏编号的旧哈希不代替本次读取。 |

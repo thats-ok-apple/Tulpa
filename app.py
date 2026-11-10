@@ -32,6 +32,9 @@ def create_app():
     install_desktop_routes(app)
     from chatlocal.mcp_routes import install_mcp_routes
     install_mcp_routes(app)
+    from chatlocal.image_index import install as install_images
+    from chatlocal.store import Store
+    install_images(app,Store())
     web=ROOT/'web'
 
     @app.get('/api/agent-presets')

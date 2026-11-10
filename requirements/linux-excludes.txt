@@ -1,0 +1,3 @@
+# RapidOCR names the desktop cv2 distribution; the terminal uses the compatible
+# headless distribution from linux-ocr.txt. Never install both cv2 providers.
+opencv-python
